@@ -54,6 +54,11 @@ Override with `from_addr` and `from_name` parameters if needed.
 - Host: `127.0.0.1:587` (STARTTLS) — LOCALHOST, not the domain name
 - Passwords: `/home/oc/.openclaw/workspace/.secrets/{agent}-email-pass`
 - Saves copy to IMAP Sent folder automatically
+- **Transport is env-overridable** for agents not running on the mailserver
+  host: `SMTP_HOST`, `SMTP_PORT`, `IMAP_HOST`, `IMAP_PORT`, and `SAVE_SENT`
+  (`SAVE_SENT=0` skips the Sent-folder copy). Defaults preserve the on-bakkies
+  behaviour. Example — golem over the tailnet:
+  `SMTP_HOST=bakkies FROM_ADDR=golem@albanialink.com PW_FILE=/etc/golem/mail.pass SAVE_SENT=0`
 
 ## Edge Cases
 - **Large attachments:** Email has ~25MB limit. For larger files, share via SyncThing or upload and send link.

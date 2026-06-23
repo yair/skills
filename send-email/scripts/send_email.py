@@ -3,6 +3,10 @@
 
 Multi-agent: reads FROM_ADDR, FROM_NAME, PW_FILE from env vars,
 or falls back to defaults based on the calling agent's workspace.
+Transport is also env-configurable (SMTP_HOST, SMTP_PORT, IMAP_HOST,
+IMAP_PORT, SAVE_SENT) — defaults to the local mailserver, so existing
+on-bakkies agents are unaffected; set SMTP_HOST for agents elsewhere on
+the tailnet (e.g. golem: SMTP_HOST=bakkies, SAVE_SENT=0).
 
 Usage:
     from send_email import send_email
@@ -27,10 +31,16 @@ from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr, formatdate, make_msgid
 from email.header import Header
 
-SMTP_HOST = "127.0.0.1"
-SMTP_PORT = 587
-IMAP_HOST = "127.0.0.1"
-IMAP_PORT = 993
+# Transport — defaults to the local mailserver (Zeresh/Fay/David run ON bakkies,
+# so localhost IS the mailserver). Override via env for agents elsewhere on the
+# tailnet (e.g. golem: SMTP_HOST=bakkies). Identical behaviour when unset.
+SMTP_HOST = os.environ.get("SMTP_HOST", "127.0.0.1")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+IMAP_HOST = os.environ.get("IMAP_HOST", "127.0.0.1")
+IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
+# Save a copy to the IMAP Sent folder? On by default (preserves prior behaviour);
+# set SAVE_SENT=0 to skip (e.g. golem alerts that need no Sent copy).
+SAVE_SENT = os.environ.get("SAVE_SENT", "1").lower() not in ("0", "false", "no", "")
 
 # Agent identity — override with env vars or detect from workspace
 _AGENTS = {
@@ -117,14 +127,15 @@ def send_email(to, subject, body, cc=None, bcc=None, content_type="html",
         smtp.login(from_addr, pw)
         smtp.sendmail(from_addr, all_recipients, msg.as_string())
 
-    # Save to IMAP Sent folder
-    try:
-        with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx) as imap:
-            imap.login(from_addr, pw)
-            imap.append("Sent", "\\Seen", imaplib.Time2Internaldate(time.time()),
-                       msg.as_bytes())
-    except Exception as e:
-        print(f"Warning: IMAP save failed: {e}", file=sys.stderr)
+    # Save a copy to the IMAP Sent folder (skip when SAVE_SENT is disabled)
+    if SAVE_SENT:
+        try:
+            with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx) as imap:
+                imap.login(from_addr, pw)
+                imap.append("Sent", "\\Seen", imaplib.Time2Internaldate(time.time()),
+                           msg.as_bytes())
+        except Exception as e:
+            print(f"Warning: IMAP save failed: {e}", file=sys.stderr)
 
     return msg["Message-ID"]
 
