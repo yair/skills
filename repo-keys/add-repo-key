@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# add-repo-key — mint/wire a per-repo deploy key on this locus.
+# Companion to the repo-keys skill (see SKILL.md alongside this file).
+# Idempotent: safe to re-run after the keymaster attaches the key.
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: add-repo-key [--rw] [--owner OWNER] [--dir CHECKOUT] <repo>
+
+Generates ~/.ssh/engine-keys/<repo> if missing, ensures the gh-<repo>
+ssh alias, prints the pubkey + the exact attach command for the
+keymaster, and (if --dir or run inside a checkout of the repo) flips
+origin to the alias URL and verifies access.
+
+  --rw           request a read-write attachment (default read-only)
+  --owner OWNER  GitHub owner (default: yair)
+  --dir DIR      checkout whose origin should use the key
+EOF
+    exit 2
+}
+
+RW=0 OWNER=yair DIR="" REPO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rw) RW=1 ;;
+        --ro) RW=0 ;;
+        --owner) OWNER=$2; shift ;;
+        --dir) DIR=$2; shift ;;
+        -h|--help) usage ;;
+        -*) echo "add-repo-key: unknown flag $1" >&2; usage ;;
+        *) [ -n "$REPO" ] && usage; REPO=$1 ;;
+    esac
+    shift
+done
+[ -n "$REPO" ] || usage
+
+LOCUS="$(whoami)@$(hostname -s)"
+KEYDIR=~/.ssh/engine-keys
+KEY=$KEYDIR/$REPO
+MODE=ro; [ "$RW" = 1 ] && MODE=rw
+
+mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"
+if [ ! -f "$KEY" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C "$LOCUS:$REPO" -f "$KEY"
+    echo "generated $KEY"
+else
+    echo "key exists: $KEY"
+fi
+
+CONF=~/.ssh/config
+touch "$CONF"; chmod 600 "$CONF"
+if ! grep -q "^Host gh-$REPO\$" "$CONF"; then
+    printf '\nHost gh-%s\n    HostName github.com\n    IdentityFile %s\n    IdentitiesOnly yes\n' \
+        "$REPO" "$KEY" >> "$CONF"
+    echo "added gh-$REPO alias to ~/.ssh/config"
+else
+    echo "ssh alias gh-$REPO already present"
+fi
+
+# Attached yet? A quick anonymous-ish probe: ls-remote via the alias.
+if git ls-remote "git@gh-$REPO:$OWNER/$REPO.git" HEAD >/dev/null 2>&1; then
+    ATTACHED=1
+    echo "key is ATTACHED on GitHub (ls-remote ok)"
+else
+    ATTACHED=0
+    cat <<EOF
+
+--- HAND THIS TO THE KEYMASTER (yair / his zhizi session) ---
+$(cat "$KEY.pub")
+gh repo deploy-key add <pubkey-file> -R $OWNER/$REPO \
+    --title "$LOCUS:$REPO ($MODE)"$([ "$RW" = 1 ] && printf ' %s' --allow-write)
+--- then re-run: add-repo-key $REPO${DIR:+ --dir $DIR} ---
+EOF
+fi
+
+# Remote wiring for a checkout.
+if [ -z "$DIR" ] && git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    URL=$(git -C . remote get-url origin 2>/dev/null || true)
+    case "$URL" in *"/$REPO.git"|*"/$REPO"|*":$OWNER/$REPO"*) DIR=. ;; esac
+fi
+if [ -n "$DIR" ]; then
+    WANT="git@gh-$REPO:$OWNER/$REPO.git"
+    HAVE=$(git -C "$DIR" remote get-url origin 2>/dev/null || echo none)
+    if [ "$HAVE" != "$WANT" ]; then
+        git -C "$DIR" remote set-url origin "$WANT"
+        echo "origin: $HAVE -> $WANT"
+    else
+        echo "origin already uses the alias"
+    fi
+    if [ "$ATTACHED" = 1 ]; then
+        git -C "$DIR" fetch -q origin && echo "verified: fetch via $KEY ok"
+    fi
+fi
+[ "$ATTACHED" = 1 ] || exit 3
