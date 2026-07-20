@@ -51,10 +51,22 @@ a minute; that is the intended flow, for humans and agents alike.
   yair before attaching.
 - Read-only unless the matrix says otherwise. Ask before requesting RW.
 
-## The flow
+## The flow — two scripts, two sides of the trust boundary
+
+`add-repo-key` runs on the SATELLITE (any locus): keygen + local
+wiring, no GitHub access needed. `attach-repo-key` runs only on the
+KEYMASTER locus (where the gh token lives — zhizi today): it attaches
+the pubkey it is handed. The split is the security model: an agent on
+a satellite can prepare everything and compose the exact attach
+command, but cannot execute it.
 
     ~/w/skills/repo-keys/add-repo-key <repo>            # RO (default)
     ~/w/skills/repo-keys/add-repo-key --rw <repo>       # RW (justify it)
+
+Keymaster side (yair or his zhizi session, per pubkey received):
+
+    ~/w/skills/repo-keys/attach-repo-key <repo> <pubkey-file>
+    echo "<pubkey line>" | ~/w/skills/repo-keys/attach-repo-key --rw <repo> -
 
 The script is idempotent: it generates the key if missing, ensures the
 ssh-config block, prints the pubkey with the exact attach command for

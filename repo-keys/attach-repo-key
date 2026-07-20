@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# attach-repo-key — the KEYMASTER's half of the repo-keys flow.
+# Runs ONLY where the GitHub token lives (zhizi today). Takes the
+# pubkey a satellite's add-repo-key printed and attaches it to the
+# repo. Satellites cannot run this: no gh auth there, by design.
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: attach-repo-key [--rw] [--owner OWNER] <repo> <pubkey-file|->
+
+Attaches a deploy key to OWNER/<repo>. Reads the pubkey from a file or
+stdin (-). The key comment (locus:repo) becomes the title, suffixed
+(ro)/(rw). Requires an authenticated gh; refuses if the same key is
+already attached (idempotent-ish: shows the existing entry instead).
+
+  --rw           attach read-write (default read-only)
+  --owner OWNER  GitHub owner (default: yair)
+EOF
+    exit 2
+}
+
+RW=0 OWNER=yair REPO="" SRC=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rw) RW=1 ;;
+        --ro) RW=0 ;;
+        --owner) OWNER=$2; shift ;;
+        -h|--help) usage ;;
+        -*) echo "attach-repo-key: unknown flag $1" >&2; usage ;;
+        *) if [ -z "$REPO" ]; then REPO=$1; else SRC=$1; fi ;;
+    esac
+    shift
+done
+[ -n "$REPO" ] && [ -n "$SRC" ] || usage
+
+gh auth status >/dev/null 2>&1 || {
+    echo "attach-repo-key: no authenticated gh here — this is the" \
+         "keymaster's tool; run it where the token lives" >&2
+    exit 1
+}
+
+if [ "$SRC" = "-" ]; then PUB=$(cat); else PUB=$(cat "$SRC"); fi
+set -- $PUB
+[ "${1:-}" = "ssh-ed25519" ] || [ "${1:-}" = "ssh-rsa" ] || {
+    echo "attach-repo-key: input does not look like an ssh pubkey" >&2
+    exit 1
+}
+COMMENT=${3:-unknown-locus}
+MODE=ro; [ "$RW" = 1 ] && MODE=rw
+TITLE="$COMMENT ($MODE)"
+
+if gh repo deploy-key list -R "$OWNER/$REPO" --json title \
+        -q '.[].title' 2>/dev/null | grep -qxF "$TITLE"; then
+    echo "already attached: '$TITLE' on $OWNER/$REPO" >&2
+    exit 0
+fi
+
+TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+printf '%s\n' "$PUB" > "$TMP"
+if [ "$RW" = 1 ]; then
+    gh repo deploy-key add "$TMP" -R "$OWNER/$REPO" --title "$TITLE" \
+        --allow-write
+else
+    gh repo deploy-key add "$TMP" -R "$OWNER/$REPO" --title "$TITLE"
+fi
+echo "attached: '$TITLE' -> $OWNER/$REPO"
