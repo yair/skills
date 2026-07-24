@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
         --ro) RW=0 ;;
         --owner) OWNER=$2; shift ;;
         -h|--help) usage ;;
+        -) if [ -z "$REPO" ]; then usage; else SRC=- ; fi ;;
         -*) echo "attach-repo-key: unknown flag $1" >&2; usage ;;
         *) if [ -z "$REPO" ]; then REPO=$1; else SRC=$1; fi ;;
     esac

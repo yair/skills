@@ -51,9 +51,15 @@ fi
 CONF=~/.ssh/config
 touch "$CONF"; chmod 600 "$CONF"
 if ! grep -q "^Host gh-$REPO\$" "$CONF"; then
-    printf '\nHost gh-%s\n    HostName github.com\n    IdentityFile %s\n    IdentitiesOnly yes\n' \
-        "$REPO" "$KEY" >> "$CONF"
-    echo "added gh-$REPO alias to ~/.ssh/config"
+    # PREPEND: ssh takes the first match per option, so the alias must
+    # precede any catch-all Host * block that names an IdentityFile --
+    # appending would offer the personal key ahead of the deploy key.
+    TMPC=$(mktemp)
+    printf 'Host gh-%s\n    HostName github.com\n    IdentityFile %s\n    IdentitiesOnly yes\n\n' \
+        "$REPO" "$KEY" > "$TMPC"
+    cat "$CONF" >> "$TMPC"
+    chmod 600 "$TMPC"; mv "$TMPC" "$CONF"
+    echo "added gh-$REPO alias to the TOP of ~/.ssh/config"
 else
     echo "ssh alias gh-$REPO already present"
 fi
