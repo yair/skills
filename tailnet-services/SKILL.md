@@ -132,8 +132,7 @@ side: the manifest's `sha256` changes and your job installs it.
 commands work in PowerShell; `openssl` is not built in (use Git's copy or
 `certutil`).
 
-Never use any other key to reach bakkies for this, root's backup key least of all:
-it can read every file there.
+Never use any other key or account to reach bakkies for this.
 
 ## Current registrations (snapshot, 2026-09-27)
 
