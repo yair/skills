@@ -22,9 +22,10 @@ Let's Encrypt, so **bakkies issues every host's certificate**. Your host never
 talks to Let's Encrypt.
 
 Inside the tailnet, bakkies' headscale overrides those names to point at your
-host. Pi-hole on golem gives the same answers to devices that do not use
-MagicDNS. Services stay tailnet-only: nothing on the public internet reaches
-them.
+host. Tailnet machines resolve through MagicDNS. Pi-hole on golem forwards the
+whole albanialink.com zone to MagicDNS, so a device that asks Pi-hole directly
+gets the same answers, with nothing copied by hand. Services stay tailnet-only:
+nothing on the public internet reaches them.
 
 Each host has **one certificate carrying all of its names**. Adding a name
 reissues it, which also changes its NPM id (`npm-N`).
@@ -73,8 +74,9 @@ bakkies then:
 1. registers the names (a reviewed change),
 2. publishes them in tailnet DNS, so they resolve to your host within seconds,
 3. reissues your host's certificate with its complete name list,
-4. files a task on golem so Pi-hole gives the same answers,
-5. tells you the new certificate id.
+4. tells you the new certificate id.
+
+Pi-hole needs nothing: it forwards to MagicDNS, so it follows automatically.
 
 A name already registered to another host is refused. Pick another.
 
