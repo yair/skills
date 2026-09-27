@@ -141,8 +141,8 @@ it can read every file there.
 | zhizi | 100.64.0.2 | `npm-21` | zhizi, telemetry, engine, tu, zchat (`.albanialink.com`); `st.zhizi.tn` |
 | effc | 100.64.0.5 | `npm-22` | effc, david, concrete, zodiduck (`.albanialink.com`); `st.effc.tn`, `widgets.effc.tn` |
 
-`david.albanialink.com` is on effc's certificate but still points at bakkies
-inside the tailnet, until effc serves it. Then bakkies switches it over.
+`david.albanialink.com` points at effc on the tailnet already. It answers as
+soon as effc serves it, and nothing on bakkies needs to change first.
 
 ## effc
 
