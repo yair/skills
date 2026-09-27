@@ -92,12 +92,46 @@ A name already registered to another host is refused. Pick another.
 
 ## Getting the certificate onto your host
 
-**Not built yet.** bakkies task `72183c59` defines it: a per-host SSH key that
-can do nothing but hand over that host's own certificate. This section gets the
-exact command when it lands.
+Each host has its own account on bakkies, `cert-<host>`, whose key can do exactly
+one thing: hand over that host's certificate, key and manifest as a tar. The key
+works only from your host's tailnet address, and it cannot open a shell, run a
+command, forward a port, or read another host's files.
 
-Until then, do not improvise. In particular, never use root's backup key for
-this: it can read every file on bakkies.
+1. **Make the key on your host**, and never copy it anywhere else:
+
+       ssh-keygen -t ed25519 -N '' -C cert-<host>-fetch -f ~/.ssh/bakkies-cert
+
+   Send only the `.pub` to bakkies: Engine geniuses through their task for
+   bakkies, OpenClaw assistants through Yair.
+2. **Fetch** (over the tailnet):
+
+       ssh -i ~/.ssh/bakkies-cert -o IdentitiesOnly=yes -o BatchMode=yes \
+           cert-<host>@bakkies.tn.albanialink.com > bundle.tar
+
+   bakkies' host key is ED25519 `SHA256:kcBAnnLiVUikVs60xYK8lUiNSQRKGukZDzZ3qXNCvgo`.
+   Pin it rather than accepting whatever answers.
+3. **Validate before trusting.** Unpack to a private temp directory, then check:
+   - `manifest.json` names your host, and exactly your registered names;
+   - `openssl x509 -in fullchain.pem -noout -ext subjectAltName` agrees;
+   - `openssl x509 -checkend 0` passes;
+   - the certificate's public key equals `openssl pkey -in privkey.pem -pubout`;
+   - the manifest's `sha256` equals the certificate's SHA-256 fingerprint
+     (colons removed, lowercase).
+4. **Install only when `sha256` changed:** stage beside the destination, key
+   `0600`, rename both, then **reload** your proxy once.
+5. **Schedule it** hourly or daily. It is idempotent, so a missed run heals on
+   the next one. bakkies refreshes its side hourly, and certificates renew 30
+   days before they expire.
+
+A new name, or a renewal, arrives the same way, with nothing to change on your
+side: the manifest's `sha256` changes and your job installs it.
+
+**Windows (effc):** Windows 10/11 ship `ssh.exe` and `tar.exe`, so the same two
+commands work in PowerShell; `openssl` is not built in (use Git's copy or
+`certutil`).
+
+Never use any other key to reach bakkies for this, root's backup key least of all:
+it can read every file there.
 
 ## Current registrations (snapshot, 2026-09-27)
 
