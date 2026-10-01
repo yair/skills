@@ -82,6 +82,28 @@ Typical agent transcript:
    (re-run; now the verify step passes) or clone fresh:
    `git clone git@gh-zeresh-ops:yair/zeresh-ops.git`.
 
+## Changing an attached key: read-only → read-write
+
+GitHub cannot change a deploy key's permission in place, and
+`attach-repo-key` refuses a key that is already attached; `add-repo-key`
+only checks reachability (`ls-remote`), which an RO key already passes.
+So upgrading an existing key is a **delete and re-attach of the same
+public key**, done by the keymaster. Keep the key: it identifies the
+locus, and nothing on the satellite changes.
+
+The upgrade is deliberately not automated: Yair decides whether a locus
+should write to a repo. Ask him in one message, with the reason and
+these exact commands for his zhizi session:
+
+    gh repo deploy-key list -R yair/<repo>       # note the ID of '<locus>:<repo> (ro)'
+    gh repo deploy-key delete <ID> -R yair/<repo>
+    echo "<the line from ~/.ssh/engine-keys/<repo>.pub>" | \
+        ~/w/skills/repo-keys/attach-repo-key --rw <repo> -
+
+Then verify on the satellite with a push you actually mean to make. A
+dry-run push does not prove write access (the check happens on the
+real push). Downgrading to RO is the same three steps without `--rw`.
+
 ## Yair's own escape hatch (humans only)
 
 The remote flip routes EVERYONE through the deploy key — including
