@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""ha — a small Home Assistant CLI for agents (skill: ha).
+
+Why: agents need to read and control Home Assistant without paying for an MCP
+server's tool definitions in every session, and without handling secrets on the
+command line. The token is read from a file by this program, never from argv.
+
+Auth: a long-lived token of a non-admin HA user (control and read, no
+configuration). Token file: $HA_TOKEN_FILE, default ~/.config/ha/token (mode 600).
+Server: $HA_URL, default http://127.0.0.1:8123.
+
+  ha states [PATTERN]                  entity, state, name (PATTERN: substring or glob)
+  ha get ENTITY                        full state as JSON
+  ha on ENTITY [key=value ...]         <domain>.turn_on, e.g. brightness_pct=40 color_temp_kelvin=2700
+  ha off ENTITY                        <domain>.turn_off
+  ha call DOMAIN.SERVICE [ENTITY] [key=value ...]
+  ha services [DOMAIN]                 available services
+  ha history ENTITY [HOURS]            state changes (default 24 h)
+  ha logbook [ENTITY] [HOURS]          logbook entries (default 24 h)
+  ha template 'JINJA'                  render a template (websocket; works for non-admins)
+  ha schedule [resume]                 a light-schedule package, where installed: status, or end a pause
+
+Values in key=value are parsed as JSON when possible (40, true, [1,2], "x").
+"""
+import base64, fnmatch, json, os, socket, ssl, struct, sys, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timedelta, timezone
+
+URL = os.environ.get("HA_URL", "http://127.0.0.1:8123").rstrip("/")
+TOKEN_FILE = os.path.expanduser(os.environ.get("HA_TOKEN_FILE", "~/.config/ha/token"))
+
+
+def die(msg, code=1):
+    print(f"ha: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except OSError as e:
+        die(f"cannot read token file {TOKEN_FILE}: {e.strerror}")
+
+
+def rest(method, path, data=None):
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(URL + path, data=body, method=method, headers={
+        "Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        die(f"{method} {path}: HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as e:
+        die(f"{URL} unreachable: {e.reason}")
+
+
+def ws_render(template):
+    """render_template over the websocket API (REST /api/template is admin-only)."""
+    u = urllib.parse.urlparse(URL)
+    port = u.port or (443 if u.scheme == "https" else 80)
+    sock = socket.create_connection((u.hostname, port), timeout=30)
+    if u.scheme == "https":
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((f"GET /api/websocket HTTP/1.1\r\nHost: {u.hostname}\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            die("websocket handshake failed")
+        buf += chunk
+    state = {"buf": buf.split(b"\r\n\r\n", 1)[1]}
+
+    def need(n):
+        while len(state["buf"]) < n:
+            chunk = sock.recv(65536)
+            if not chunk:
+                die("websocket closed")
+            state["buf"] += chunk
+        out, state["buf"] = state["buf"][:n], state["buf"][n:]
+        return out
+
+    def recv():
+        msg = b""
+        while True:
+            b1, b2 = need(2)
+            n = b2 & 0x7F
+            if n == 126:
+                n = struct.unpack("!H", need(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", need(8))[0]
+            msg += need(n)
+            if b1 & 0x80:
+                return json.loads(msg)
+
+    def send(obj):
+        data, mask = json.dumps(obj).encode(), os.urandom(4)
+        n = len(data)
+        hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else
+                               bytes([0x80 | 126]) + struct.pack("!H", n) if n < 65536 else
+                               bytes([0x80 | 127]) + struct.pack("!Q", n))
+        sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    recv()
+    send({"type": "auth", "access_token": token()})
+    if recv().get("type") != "auth_ok":
+        die("websocket authentication failed")
+    send({"id": 1, "type": "render_template", "template": template, "report_errors": True})
+    while True:
+        m = recv()
+        if m.get("id") != 1:
+            continue
+        if m.get("type") == "result" and not m.get("success"):
+            die(f"template: {m.get('error', {}).get('message')}")
+        if m.get("type") == "event":
+            ev = m["event"]
+            if "error" in ev:
+                die(f"template: {ev['error']}")
+            return ev.get("result")
+
+
+def parse_kv(args):
+    data = {}
+    for a in args:
+        if "=" not in a:
+            die(f"expected key=value, got {a!r}")
+        k, v = a.split("=", 1)
+        try:
+            data[k] = json.loads(v)
+        except json.JSONDecodeError:
+            data[k] = v
+    return data
+
+
+def since(hours):
+    return (datetime.now(timezone.utc) - timedelta(hours=float(hours))).isoformat()
+
+
+def short(state):
+    a = state.get("attributes", {})
+    extra = []
+    if state["entity_id"].startswith("light.") and state["state"] == "on":
+        if a.get("brightness") is not None:
+            extra.append(f"{round(a['brightness'] / 2.55)}%")
+        if a.get("color_temp_kelvin"):
+            extra.append(f"{a['color_temp_kelvin']}K")
+    if a.get("unit_of_measurement"):
+        extra.append(a["unit_of_measurement"])
+    name = a.get("friendly_name", "")
+    return f"{state['entity_id']:<50} {state['state']:<14} {' '.join(extra):<12} {name}"
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, args = argv[0], argv[1:]
+
+    if cmd == "states":
+        states = rest("GET", "/api/states")
+        pat = args[0] if args else None
+        for s in sorted(states, key=lambda s: s["entity_id"]):
+            eid = s["entity_id"]
+            name = s.get("attributes", {}).get("friendly_name", "")
+            if pat and not (fnmatch.fnmatch(eid, pat) or pat.lower() in eid.lower() or pat.lower() in name.lower()):
+                continue
+            print(short(s))
+    elif cmd == "get" and len(args) == 1:
+        print(json.dumps(rest("GET", f"/api/states/{args[0]}"), indent=2))
+    elif cmd in ("on", "off") and args:
+        entity, data = args[0], parse_kv(args[1:])
+        domain = entity.split(".", 1)[0]
+        rest("POST", f"/api/services/{domain}/turn_{cmd}", {"entity_id": entity, **data})
+        print(short(rest("GET", f"/api/states/{entity}")))
+    elif cmd == "call" and args and "." in args[0]:
+        domain, service = args[0].split(".", 1)
+        rest_args = args[1:]
+        data = {}
+        if rest_args and "=" not in rest_args[0]:
+            data["entity_id"] = rest_args[0]
+            rest_args = rest_args[1:]
+        data.update(parse_kv(rest_args))
+        changed = rest("POST", f"/api/services/{domain}/{service}", data) or []
+        for s in changed:
+            print(short(s))
+        if not changed:
+            print("ok")
+    elif cmd == "services":
+        for d in sorted(rest("GET", "/api/services"), key=lambda d: d["domain"]):
+            if args and d["domain"] != args[0]:
+                continue
+            print(f"{d['domain']}: {', '.join(sorted(d['services']))}")
+    elif cmd == "history" and args:
+        hours = args[1] if len(args) > 1 else 24
+        q = urllib.parse.urlencode({"filter_entity_id": args[0], "no_attributes": "1"})
+        for series in rest("GET", f"/api/history/period/{urllib.parse.quote(since(hours))}?{q}") or []:
+            for s in series:
+                print(f"{s.get('last_changed', '')[:19]}  {s.get('state')}")
+    elif cmd == "logbook":
+        entity = args[0] if args and not args[0].replace(".", "").isdigit() else None
+        hours = args[-1] if args and args[-1].replace(".", "").isdigit() else 24
+        q = "?" + urllib.parse.urlencode({"entity": entity}) if entity else ""
+        for e in rest("GET", f"/api/logbook/{urllib.parse.quote(since(hours))}{q}") or []:
+            print(f"{e.get('when', '')[:19]}  {e.get('name', '')}: {e.get('message', e.get('state', ''))}"
+                  + (f"  [{e['entity_id']}]" if e.get("entity_id") and not entity else ""))
+    elif cmd == "template" and len(args) == 1:
+        print(ws_render(args[0]))
+    elif cmd == "schedule":
+        if args == ["resume"]:
+            rest("POST", "/api/services/input_button/press", {"entity_id": "input_button.light_schedule_resume"})
+            print("resumed")
+        t = rest("GET", "/api/states/sensor.light_schedule_target")
+        p = rest("GET", "/api/states/input_datetime.light_schedule_paused_until")
+        a = t["attributes"]
+        print(f"phase {t['state']}: target {a.get('brightness_pct')}% {a.get('kelvin')}K, "
+              f"next waypoint {str(a.get('next_waypoint'))[11:16]}, "
+              + (f"PAUSED until {p['state'][11:16]}" if a.get("paused") else "running"))
+    else:
+        die(f"unknown or incomplete command: {' '.join(argv)} (see: ha help)", 2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
