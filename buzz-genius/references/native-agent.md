@@ -60,7 +60,10 @@ approvals to `never`, network on, and no `danger-full-access`; and it refuses
 any approval request Codex still makes, so none reaches sprig. The host's
 `buzz-agent` launcher sets `CODEX_PATH` itself and refuses to start without
 the wrapper; `buzz-host-update` refuses an adapter version that would no
-longer start Codex from `CODEX_PATH`.
+longer start Codex from `CODEX_PATH`. Every rewrite and refusal is logged
+to the journal under the agent's unit (`SYSLOG_IDENTIFIER=codex-fenced`;
+`journalctl -u buzz-agent@<genius> -t codex-fenced`). It writes to journald
+directly because the adapter keeps the wrapper's stderr for itself.
 
 The settings still say what is meant, and keep the adapter from being sent a
 mode it does not define:
@@ -80,8 +83,9 @@ network stays on for the CLI, Engine and brain.
 It drives the adapter behind the wrapper with a client that approves
 everything, as sprig does, tells the agent it may escalate, and judges from
 the filesystem: no permission asked, nothing written outside the workspace,
-sudo not root, network and workspace working. `ok` and exit 0, or `BREACH`
-lines. `codex sandbox -c …` is **not** a fence test: it checks the flags you
+sudo not root, network and workspace working, and, where the account has
+them, `engine` and `brain` working inside the sandbox. `ok` and exit 0, or
+`BREACH`/`FAIL` lines. `codex sandbox -c …` is **not** a fence test: it checks the flags you
 give it, not what the adapter sends, and it passed while the agent above was
 escaping. Rerun `buzz-fence-test` after any adapter upgrade you doubt.
 

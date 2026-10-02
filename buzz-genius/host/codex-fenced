@@ -19,14 +19,18 @@ JSON-RPC on stdio) and:
      asks; a command the sandbox stops just fails.
   2. answers any approval request Codex still makes (command, file change,
      extra permissions) with a refusal itself, so none reaches the adapter
-     and sprig's auto-approve. Logged to stderr (the agent's journal).
+     and sprig's auto-approve.
+Both are logged to the journal directly (SYSLOG_IDENTIFIER=codex-fenced), so
+they show under the agent's unit (`journalctl -u buzz-agent@<genius>`): the
+adapter keeps this process's stderr for itself, and nothing written there
+reaches the journal. Without a journal socket, it falls back to stderr.
 Everything else passes through untouched. Any other invocation (`codex
 login`, ...) execs the real Codex unchanged.
 
 Real Codex: the adapter's bundled one (node .../@openai/codex/bin/codex.js),
 or CODEX_FENCED_REAL.
 """
-import json, os, signal, subprocess, sys, threading
+import json, os, signal, socket, subprocess, sys, threading
 
 LIB = "/usr/local/lib/buzz/codex-acp/current/node_modules"
 REAL = os.environ.get("CODEX_FENCED_REAL") or f"{LIB}/@openai/codex/bin/codex.js"
@@ -39,7 +43,21 @@ DENY = {
 }
 
 
-def log(msg):
+JOURNAL = "/run/systemd/journal/socket"
+
+
+def log(msg, priority=5):
+    """One journal entry (5 notice: a rewrite; 4 warning: a refusal). journald
+    files it under the sender's unit, which is the agent's. Native protocol,
+    one KEY=value per line, so newlines in the message are flattened."""
+    entry = (f"MESSAGE=codex-fenced: {msg}".replace("\n", " ") + "\n"
+             f"PRIORITY={priority}\nSYSLOG_IDENTIFIER=codex-fenced\n").encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(entry, JOURNAL)
+        return
+    except OSError:
+        pass
     print(f"codex-fenced: {msg}", file=sys.stderr, flush=True)
 
 
@@ -126,7 +144,7 @@ def main():
         if isinstance(msg, dict) and msg.get("method") in DENY and "id" in msg:
             p = msg.get("params") or {}
             what = p.get("command") or p.get("reason") or p.get("itemId") or ""
-            log(f"refused {msg['method']} {str(what)[:200]!r}")
+            log(f"refused {msg['method']} {str(what)[:200]!r}", priority=4)
             reply = {"id": msg["id"], "result": DENY[msg["method"]]}
             if "jsonrpc" in msg:
                 reply = {"jsonrpc": msg["jsonrpc"], **reply}

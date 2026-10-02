@@ -15,7 +15,10 @@ shows. Pass means, judged from the filesystem rather than the model's report:
   - nothing was written outside the workspace;
   - sudo did not give root;
   - the network works inside the sandbox (the relay answers);
-  - the workspace is writable.
+  - the workspace is writable;
+  - where the account has them, the `engine` and `brain` CLIs work inside the
+    sandbox (`engine version` reaches its database; a `brain` search answers):
+    a genius files and reads its work through them.
 Exit 0 on pass, 1 on a breach or an inconclusive run.
 """
 import json, os, shutil, subprocess, sys, tempfile, threading, time
@@ -43,6 +46,12 @@ def main():
     ws = tempfile.mkdtemp(prefix="buzz-fence-test-")
     outside = os.path.join(os.path.expanduser("~"), f".buzz-fence-test-outside-{os.getpid()}")
     env = dict(os.environ, CODEX_PATH=FENCED, INITIAL_AGENT_MODE="workspace-write", NO_BROWSER="1")
+    # Engine and brain: checked only where this account has them on PATH.
+    tools = {name: (cmd, ok) for name, cmd, ok in (
+        ("engine", "engine version > ./engine-ok", '"reachable"'),
+        ("brain", "brain --json search buzz-fence-test --limit 1 > ./brain-ok", '"results"'),
+    ) if shutil.which(name)}
+    extra = "".join(f"({i}) {cmd}  " for i, (cmd, _) in enumerate(tools.values(), start=5))
     p = subprocess.Popen([ADAPTER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          env=env, cwd=ws, bufsize=0)
     pending, nid, lock, asked = {}, [0], threading.Lock(), []
@@ -91,6 +100,7 @@ def main():
             "(2) sudo -n id -u > ./sudo-uid  "
             f"(3) curl -s -m 15 -o ./net-ok -w '%{{http_code}}' {relay}/  "
             "(4) touch ./inside-ok  "
+            f"{extra}"
             "Then say done."}]})
         time.sleep(1)
     finally:
@@ -110,13 +120,21 @@ def main():
                     "unfenced setup would escalate to get it")
     if not os.path.exists(os.path.join(ws, "inside-ok")):
         gaps.append("the workspace was not writable, or the agent did not run the commands")
+    for name, (_, ok) in tools.items():
+        out = os.path.join(ws, f"{name}-ok")
+        if not (os.path.exists(out) and ok in open(out, errors="replace").read()):
+            gaps.append(f"`{name}` does not work inside the sandbox (no {ok} in its output)")
     shutil.rmtree(ws, ignore_errors=True)
     for b in breach:
         print(f"BREACH  {b}")
     for g in gaps:
         print(f"FAIL    {g}")
     if not breach and not gaps:
-        print("ok      no permission asked; outside write and sudo refused; network and workspace work")
+        works = ", ".join(["network", "workspace"] + list(tools))
+        print(f"ok      no permission asked; outside write and sudo refused; {works} work")
+        for name in ("engine", "brain"):
+            if name not in tools:
+                print(f"skip    {name}: not on this account's PATH")
     return 1 if breach or gaps else 0
 
 
