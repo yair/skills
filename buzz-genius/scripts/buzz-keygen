@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""buzz-keygen GENIUS — create a Buzz (Nostr) identity for a genius.
+
+Writes a fresh secp256k1 secret key, as 64 hex characters, to
+~/.config/buzz/GENIUS.key (mode 600; refuses to overwrite) and prints the
+public key as npub and hex. The secret never leaves the file: hand only the
+npub to the relay operator and the owner. Standard library only; the key math
+is buzz-vouch's (same directory).
+"""
+import importlib.machinery, importlib.util, os, re, secrets, sys
+
+here = os.path.dirname(os.path.realpath(__file__))
+loader = importlib.machinery.SourceFileLoader("buzz_vouch", os.path.join(here, "buzz-vouch"))
+spec = importlib.util.spec_from_loader("buzz_vouch", loader)
+bv = importlib.util.module_from_spec(spec)
+loader.exec_module(bv)
+
+CS = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def npub(pk):
+    acc, bits, data = 0, 0, []
+    for b in pk:
+        acc = (acc << 8) | b
+        bits += 8
+        while bits >= 5:
+            bits -= 5
+            data.append((acc >> bits) & 31)
+    if bits:
+        data.append((acc << (5 - bits)) & 31)
+    hrp = "npub"
+    exp = [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+    pm = bv._polymod(exp + data + [0] * 6) ^ 1
+    return hrp + "1" + "".join(CS[d] for d in data + [(pm >> 5 * (5 - i)) & 31 for i in range(6)])
+
+
+def main():
+    if len(sys.argv) != 2 or not re.fullmatch(r"[a-z0-9-]+", sys.argv[1]):
+        sys.exit("usage: buzz-keygen GENIUS   (lowercase letters, digits, -)")
+    path = os.path.expanduser(f"~/.config/buzz/{sys.argv[1]}.key")
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    while True:
+        sk = secrets.token_bytes(32)
+        if 1 <= int.from_bytes(sk, "big") < bv.N:
+            break
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # never overwrite an identity
+    except FileExistsError:
+        sys.exit(f"{path} already exists; an identity is never overwritten (remove it yourself if you mean to)")
+    with os.fdopen(fd, "w") as f:
+        f.write(sk.hex())
+    pk = bv.pubkey_of(sk)
+    assert bv.key32(npub(pk), "npub") == pk  # round-trip through the decoder
+    print(f"wrote {path} (mode 600)\nnpub {npub(pk)}\nhex  {pk.hex()}")
+
+
+if __name__ == "__main__":
+    main()
