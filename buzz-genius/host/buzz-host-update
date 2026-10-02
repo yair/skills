@@ -191,7 +191,8 @@ def sprig_plan(c, state):
     if rev:
         if have and state.get("sprig_relay_revision") == rev:
             return f"relay still at {rev[:7]}; sprig {have} stays", None, rev
-        return f"relay at {rev[:7]} (sprig followed {str(state.get('sprig_relay_revision'))[:7]})", "latest", rev
+        was = state.get("sprig_relay_revision")
+        return f"relay at {rev[:7]} (" + (f"sprig followed {was[:7]}" if was else "first time in step") + ")", "latest", rev
     return f"relay revision unavailable ({why}); following sprig-latest", "latest", None
 
 
