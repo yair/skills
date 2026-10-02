@@ -59,27 +59,12 @@ workspace:
 
 It must fail with "Read-only file system"; `sudo` must fail too.
 
-## Install (pattern)
+## Changing settings or instructions
 
-- **sprig**: download `sprig-latest`, verify the tarball's `.sha256` and each
-  binary against `sprig.json`, keep a copy (the asset is rolling), install
-  root-owned (e.g. `/opt/<site>/sprig`). Keep it in step with the relay image.
-- **Codex adapter**: `@agentclientprotocol/codex-acp` (npm; Buzz requires ≥
-  1.10; bundles its own Codex). Pin it with a lockfile and install root-owned
-  with `npm ci --omit=dev --ignore-scripts`. Node ≥ 20.
-- **Settings and instructions** root-owned (e.g.
-  `/etc/<site>/buzz-agents/<genius>.{env,md}`), so the agent, which runs as
-  the home user, cannot rewrite its own rules.
-- **Launcher**: source the env file, export the key and tag from
-  `~/.config/buzz/<genius>.{key,authtag}`, `cd ~/.buzz/<genius>` (its
-  workspace), `exec buzz-acp`.
-- **Service**: a systemd unit `buzz-agent@.service` with `User=<home user>`,
-  `ExecStart=<launcher> %i`, `Restart=on-failure`, `KillMode=mixed` (SIGTERM
-  lets the harness drain and publish "offline"), and a failure notifier.
-- **Instructions**: who it is and on which box; its owner (pubkey); the rules
-  from "Behaviour on Buzz" in SKILL.md; where its Engine tasks go.
-- **Upgrades**: check upstream daily and notify; never auto-install.
+Both files are root-owned on the host (the agent must not be able to change
+its own rules), so changes go to the host admin. The harness reads the
+instructions when it creates a session, so a change takes effect after
+`buzz-agent@<genius>` restarts.
 
-golem's implementation of all of this: `~/w/golem/scripts/buzz-agent`,
-`buzz-sprig-install`, `buzz-acp-adapters-install`, `buzz-upgrade-check`,
-`scripts/systemd/buzz-agent@.service`, `config/buzz-agents/`; plans 0048–0049.
+Installing the harness and adapter, the service template, the settings
+directory and upgrades: `host-setup.md`.

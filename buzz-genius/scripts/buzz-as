@@ -5,17 +5,18 @@
 # present, its owner's NIP-OA tag from ~/.config/buzz/GENIUS.authtag (public;
 # from buzz-vouch), and passes both to the CLI through its environment, never
 # argv. Relay: $BUZZ_RELAY_URL, else the first line of ~/.config/buzz/relay.
+# Exits 64 on a usage error, 78 when the key or relay is not configured.
 #   buzz-as golem-admin messages get --channel <uuid> --limit 5
 set -euo pipefail
 g=${1:-}
 case "$g" in ''|*[!a-z0-9-]*) echo "usage: buzz-as GENIUS ARGS…" >&2; exit 64;; esac
 shift
 dir=${BUZZ_KEY_DIR:-$HOME/.config/buzz}
-[ -r "$dir/$g.key" ] || { echo "buzz-as: cannot read $dir/$g.key (buzz-keygen $g creates it)" >&2; exit 3; }
+[ -r "$dir/$g.key" ] || { echo "buzz-as: cannot read $dir/$g.key (buzz-keygen $g creates it)" >&2; exit 78; }
 BUZZ_PRIVATE_KEY=$(cat "$dir/$g.key")
 export BUZZ_PRIVATE_KEY
 if [ -r "$dir/$g.authtag" ]; then BUZZ_AUTH_TAG=$(cat "$dir/$g.authtag"); export BUZZ_AUTH_TAG; fi
 if [ -z "${BUZZ_RELAY_URL:-}" ] && [ -r "$dir/relay" ]; then BUZZ_RELAY_URL=$(head -1 "$dir/relay"); fi
-[ -n "${BUZZ_RELAY_URL:-}" ] || { echo "buzz-as: set BUZZ_RELAY_URL or write the relay URL to $dir/relay" >&2; exit 64; }
+[ -n "${BUZZ_RELAY_URL:-}" ] || { echo "buzz-as: set BUZZ_RELAY_URL or write the relay URL to $dir/relay" >&2; exit 78; }
 export BUZZ_RELAY_URL
 exec buzz "$@"

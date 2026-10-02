@@ -33,6 +33,10 @@ JSON line on stdout; progress on stderr.
 import argparse, base64, csv, getpass, hashlib, json, os, sys, time, urllib.error, urllib.request, uuid
 
 # --- BIP-340 Schnorr over secp256k1 (after the BIP's reference code) ---------
+# Plain Python integers: correct (see --self-test) but NOT constant-time, so
+# timing can leak bits of the key to a local observer. Acceptable for a
+# one-shot signature on the owner's own machine; do not reuse this code where
+# it signs repeatedly with a long-lived key (a service, a relay, a bot).
 P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
@@ -275,7 +279,11 @@ def main():
         event = sign_event(owner_sk, 30177, [["d", agent]], json.dumps(content, separators=(",", ":")))
         print(f"policy event (kind 30177): {event['content']}", file=sys.stderr)
         if not a.yes:
-            with open("/dev/tty") as tty:
+            try:
+                tty = open("/dev/tty")
+            except OSError:
+                sys.exit("no terminal to confirm on; check the policy above and rerun with --yes")
+            with tty:
                 print(f"Publish it to {a.relay}? [y/N] ", end="", file=sys.stderr, flush=True)
                 if tty.readline().strip().lower() not in ("y", "yes"):
                     sys.exit("not published")
