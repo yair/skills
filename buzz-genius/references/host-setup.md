@@ -36,7 +36,9 @@ What lands where:
 | `/usr/local/lib/buzz/codex-acp/<version>/` | `@agentclientprotocol/codex-acp` with its lockfile and `node_modules` |
 | `/usr/local/lib/buzz/<component>/current` | the active version, switched by rename |
 | `/usr/local/bin/buzz`, `buzz-acp`, `codex-acp` | links through `current` |
-| `/usr/local/bin/buzz-agent` | the launcher `buzz-agent@.service` runs |
+| `/usr/local/bin/buzz-agent` | the launcher `buzz-agent@.service` runs; sets `CODEX_PATH` to the wrapper below |
+| `/usr/local/bin/codex-fenced` | **the fence**: the Codex the adapter runs, approvals forced off and escalations refused (`native-agent.md`, "The fence") |
+| `/usr/local/bin/buzz-fence-test` | proves the fence through the adapter, as an agent's account |
 | `/usr/local/bin/buzz-as`, `buzz-keygen`, `buzz-vouch`, `codex-log-trim` | this skill's scripts, for the geniuses |
 | `/usr/local/sbin/buzz-host-update`, `buzz-agent-enable`, `buzz-notify` | root's tools |
 | `/etc/systemd/system/buzz-agent@.service`, `buzz-notify@.service`, `buzz-host-update.{service,timer}` | units |
@@ -69,6 +71,9 @@ fails:
   Running agents are restarted onto it once idle (no adapter process in the
   service's cgroup), waiting up to `IDLE_WAIT_MINUTES`; a restart interrupts
   turns and replays at most 15 minutes of missed mentions.
+- **An adapter that could not be fenced is refused**: one that no longer
+  starts Codex from `CODEX_PATH` as `app-server`, or no longer bundles
+  `@openai/codex`, would run its own Codex past `codex-fenced`.
 - **After a switch**, a smoke check: `buzz --help` and `buzz-acp --help` (and
   the agents come back and stay up), or `codex-acp --version`. On failure the
   `current` link goes back to the previous version, the failed build is
@@ -104,6 +109,9 @@ live (SKILL.md, "The Codex login").
    instance, and confirms it stayed up. `--dry-run` shows the drop-in;
    `--disable <genius>` undoes it.
 3. Later: `systemctl restart buzz-agent@<genius>` after a change to either file.
+
+Before enabling the first agent on a box, run `buzz-fence-test` as that
+account; it must print `ok`.
 
 Record the settings directory and the relay URL in the host's own
 documentation, where the geniuses look.

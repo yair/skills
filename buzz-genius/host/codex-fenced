@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+"""codex-fenced -- the Codex the ACP adapter runs (its CODEX_PATH), with the
+fence enforced where the adapter cannot undo it.
+
+Why: sprig auto-approves every permission request an agent makes, so a
+native agent's only fence is Codex's own sandbox with approvals off. The
+Codex ACP adapter (2.1.1) ignores CODEX_CONFIG's approval_policy and network
+setting for turns: each turn/start carries its agent mode's policy, and
+workspace-write means approvals "on-request" and NO network. So a networked
+command (every `buzz messages send`) fails in the sandbox, Codex asks to run
+it unsandboxed, sprig approves, and it runs as the account -- which may have
+passwordless sudo. Observed on bakkies, 2026-10-02 (bakkies-docker plans/025).
+
+This sits between the adapter and `codex app-server` (newline-delimited
+JSON-RPC on stdio) and:
+  1. rewrites every request the adapter sends so that any approval policy is
+     "never", any sandbox policy is a workspace-write or read-only one with
+     network on, and no sandbox mode is danger-full-access. Codex then never
+     asks; a command the sandbox stops just fails.
+  2. answers any approval request Codex still makes (command, file change,
+     extra permissions) with a refusal itself, so none reaches the adapter
+     and sprig's auto-approve. Logged to stderr (the agent's journal).
+Everything else passes through untouched. Any other invocation (`codex
+login`, ...) execs the real Codex unchanged.
+
+Real Codex: the adapter's bundled one (node .../@openai/codex/bin/codex.js),
+or CODEX_FENCED_REAL.
+"""
+import json, os, signal, subprocess, sys, threading
+
+LIB = "/usr/local/lib/buzz/codex-acp/current/node_modules"
+REAL = os.environ.get("CODEX_FENCED_REAL") or f"{LIB}/@openai/codex/bin/codex.js"
+DENY = {
+    "item/commandExecution/requestApproval": {"decision": "decline"},
+    "item/fileChange/requestApproval": {"decision": "decline"},
+    "item/permissions/requestApproval": {"permissions": {}, "scope": "turn", "strictAutoReview": False},
+    "execCommandApproval": {"decision": "denied"},
+    "applyPatchApproval": {"decision": "denied"},
+}
+
+
+def log(msg):
+    print(f"codex-fenced: {msg}", file=sys.stderr, flush=True)
+
+
+def real_cmd(args):
+    return (["node", REAL] if REAL.endswith(".js") else [REAL]) + args
+
+
+def fence(obj, changes, path=""):
+    """Rewrite policy fields anywhere in a request's params, in place."""
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            fence(v, changes, f"{path}[{i}]")
+        return
+    if not isinstance(obj, dict):
+        return
+    for k, v in list(obj.items()):
+        here = f"{path}.{k}" if path else k
+        if k in ("approvalPolicy", "approval_policy") and v != "never":
+            obj[k] = "never"
+            changes.append(f"{here} {v!r}->never")
+        elif k == "sandboxPolicy" and isinstance(v, dict):
+            if v.get("type") not in ("workspaceWrite", "readOnly"):
+                obj[k] = v = {"type": "workspaceWrite", "writableRoots": [], "networkAccess": True,
+                              "excludeTmpdirEnvVar": False, "excludeSlashTmp": False}
+                changes.append(f"{here} -> workspaceWrite")
+            if v.get("networkAccess") is not True:
+                v["networkAccess"] = True
+                changes.append(f"{here}.networkAccess on")
+        elif k in ("sandbox", "sandboxMode", "sandbox_mode") and v == "danger-full-access":
+            obj[k] = "workspace-write"
+            changes.append(f"{here} danger-full-access->workspace-write")
+        elif k == "sandbox_workspace_write" and isinstance(v, dict) and v.get("network_access") is not True:
+            v["network_access"] = True
+            changes.append(f"{here}.network_access on")
+        else:
+            fence(v, changes, here)
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] != ["app-server"]:
+        cmd = real_cmd(args)
+        os.execvp(cmd[0], cmd)
+    child = subprocess.Popen(real_cmd(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    to_child = threading.Lock()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda s, f: child.send_signal(s))
+
+    def send_child(line):
+        with to_child:
+            child.stdin.write(line)
+            child.stdin.flush()
+
+    def adapter_to_codex():
+        try:
+            for line in sys.stdin.buffer:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    send_child(line)
+                    continue
+                if isinstance(msg, dict) and "method" in msg and "params" in msg:
+                    changes = []
+                    fence(msg["params"], changes)
+                    if changes:
+                        log(f"{msg['method']}: " + ", ".join(changes))
+                        line = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+                send_child(line)
+        except (BrokenPipeError, ValueError):
+            pass
+        finally:
+            try:
+                child.stdin.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=adapter_to_codex, daemon=True).start()
+    out = sys.stdout.buffer
+    for line in child.stdout:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = None
+        if isinstance(msg, dict) and msg.get("method") in DENY and "id" in msg:
+            p = msg.get("params") or {}
+            what = p.get("command") or p.get("reason") or p.get("itemId") or ""
+            log(f"refused {msg['method']} {str(what)[:200]!r}")
+            reply = {"id": msg["id"], "result": DENY[msg["method"]]}
+            if "jsonrpc" in msg:
+                reply = {"jsonrpc": msg["jsonrpc"], **reply}
+            send_child((json.dumps(reply, separators=(",", ":")) + "\n").encode())
+            continue
+        try:
+            out.write(line)
+            out.flush()
+        except BrokenPipeError:
+            break
+    sys.exit(child.wait())
+
+
+if __name__ == "__main__":
+    main()

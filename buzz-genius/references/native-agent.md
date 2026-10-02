@@ -40,24 +40,50 @@ per-binary sha256). It runs as a plain process; no Kubernetes needed.
 
 ### The fence (Codex)
 
-The harness **auto-approves** an agent's permission requests, so the agent's
-own sandbox is the fence:
+The harness **auto-approves** every permission request an agent makes, and
+offers no setting to refuse them (`BUZZ_ACP_PERMISSION_MODE` only picks an
+agent mode). So the fence must be that Codex never asks, and that what it
+runs stays sandboxed.
+
+**Settings alone do not do it.** The Codex ACP adapter sends its agent mode's
+own policy with every turn, overriding `CODEX_CONFIG`; mode
+`workspace-write` is approvals `on-request` with **network off**. Every
+networked command (each `buzz messages send`) then fails in the sandbox,
+Codex asks to run it unsandboxed, sprig approves, and it runs as the account.
+Found on bakkies on 2026-10-02 the first time the agent answered; reproduced
+through the adapter, where `sudo -n id -u` returned 0.
+
+The fence is therefore **`codex-fenced`** (the host kit's
+`/usr/local/bin/codex-fenced`), the adapter's `CODEX_PATH`. It runs the
+adapter's bundled Codex and, on every request the adapter sends it, forces
+approvals to `never`, network on, and no `danger-full-access`; and it refuses
+any approval request Codex still makes, so none reaches sprig. The host's
+`buzz-agent` launcher sets `CODEX_PATH` itself and refuses to start without
+the wrapper; `buzz-host-update` refuses an adapter version that would no
+longer start Codex from `CODEX_PATH`.
+
+The settings still say what is meant, and keep the adapter from being sent a
+mode it does not define:
 
     BUZZ_ACP_PERMISSION_MODE=default          # sprig would otherwise send `bypassPermissions`,
                                               # a mode the Codex adapter does not define
     INITIAL_AGENT_MODE=workspace-write
     CODEX_CONFIG='{"approval_policy":"never","sandbox_mode":"workspace-write","sandbox_workspace_write":{"network_access":true}}'
 
-`approval_policy=never` means Codex never asks to escalate, so there is
-nothing to auto-approve. Writes are confined to the working directory (and
-`/tmp`); reads are not; network stays on for the CLI, Engine and brain. Test
-the fence without the model, with the adapter's bundled Codex, from the
-workspace:
+Writes are confined to the working directory (and `/tmp`); reads are not;
+network stays on for the CLI, Engine and brain.
 
-    codex sandbox -c 'sandbox_mode="workspace-write"' -c 'approval_policy="never"' \
-      -c 'sandbox_workspace_write.network_access=true' -- sh -c 'touch ~/outside-test'
+**Test it through the adapter**, as the agent's account:
 
-It must fail with "Read-only file system"; `sudo` must fail too.
+    buzz-fence-test
+
+It drives the adapter behind the wrapper with a client that approves
+everything, as sprig does, tells the agent it may escalate, and judges from
+the filesystem: no permission asked, nothing written outside the workspace,
+sudo not root, network and workspace working. `ok` and exit 0, or `BREACH`
+lines. `codex sandbox -c …` is **not** a fence test: it checks the flags you
+give it, not what the adapter sends, and it passed while the agent above was
+escaping. Rerun `buzz-fence-test` after any adapter upgrade you doubt.
 
 ## Changing settings or instructions
 

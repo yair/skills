@@ -261,6 +261,18 @@ def adapter_plan(c, state):
     return f"codex-acp {have or 'absent'} -> {up}", up
 
 
+def fenceable(root):
+    """The fence (codex-fenced) works only while the adapter starts Codex from
+    CODEX_PATH as `<CODEX_PATH> app-server`. A version that stops doing so
+    would run its bundled Codex unfenced, so it is refused, not installed."""
+    js = open(f"{root}/node_modules/{ADAPTER}/dist/index.js").read()
+    if 'process.env["CODEX_PATH"]' not in js or '"app-server"' not in js:
+        raise RuntimeError("this adapter no longer starts Codex from CODEX_PATH as `app-server`; "
+                           "codex-fenced could not fence it, so it is not installed")
+    if not os.path.exists(f"{root}/node_modules/@openai/codex/bin/codex.js"):
+        raise RuntimeError("this adapter no longer bundles @openai/codex/bin/codex.js, which codex-fenced runs")
+
+
 def adapter_install(version):
     """Resolve a lockfile for exactly <version> and `npm ci` it, scripts off."""
     os.makedirs(f"{LIB}/codex-acp", exist_ok=True)
@@ -279,6 +291,7 @@ def adapter_install(version):
         locked = lock["packages"][f"node_modules/{ADAPTER}"]["version"]
         if locked != version:
             raise RuntimeError(f"lockfile resolved {locked}, wanted {version}")
+        fenceable(stage)
         r = run([f"{stage}/node_modules/.bin/codex-acp", "--version"], timeout=60)
         if r.returncode != 0 or r.stdout.split()[-1:] != [version]:
             raise RuntimeError(f"codex-acp --version says {r.stdout.strip()!r}, wanted {version}")
@@ -297,6 +310,7 @@ def adapter_install(version):
 def adapter_smoke(version):
     if FAIL == "codex-acp":
         raise RuntimeError("test: smoke failure requested")
+    fenceable(f"{LIB}/codex-acp/current")
     r = run([f"{BIN}/codex-acp", "--version"], timeout=60)
     if r.returncode != 0 or r.stdout.split()[-1:] != [version]:
         raise RuntimeError(f"codex-acp --version through {BIN} says {r.stdout.strip()!r}")

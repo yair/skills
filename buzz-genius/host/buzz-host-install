@@ -23,6 +23,8 @@ manifest="
 0755|host/buzz-agent-enable|/usr/local/sbin/buzz-agent-enable
 0755|host/buzz-notify|/usr/local/sbin/buzz-notify
 0755|host/buzz-agent|/usr/local/bin/buzz-agent
+0755|host/codex-fenced|/usr/local/bin/codex-fenced
+0755|host/buzz-fence-test|/usr/local/bin/buzz-fence-test
 0755|scripts/buzz-as|/usr/local/bin/buzz-as
 0755|scripts/buzz-keygen|/usr/local/bin/buzz-keygen
 0755|scripts/buzz-vouch|/usr/local/bin/buzz-vouch

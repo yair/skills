@@ -36,6 +36,11 @@ set -a
 # shellcheck source=/dev/null
 . "$conf"
 set +a
+# The fence is the host's, not the genius's: Codex always runs behind
+# codex-fenced, whatever the settings say (sprig auto-approves everything the
+# agent asks, and the adapter's own modes ask; see codex-fenced).
+export CODEX_PATH=/usr/local/bin/codex-fenced
+[ -x "$CODEX_PATH" ] || { echo "buzz-agent: $CODEX_PATH is missing; refusing to run unfenced" >&2; exit 78; }
 BUZZ_PRIVATE_KEY=$(cat "$key")
 BUZZ_AUTH_TAG=$(cat "$tag")
 export BUZZ_PRIVATE_KEY BUZZ_AUTH_TAG

@@ -112,8 +112,11 @@ settings directory) live with that host's documentation, not here.
      the agent must not be able to rewrite its own rules.
    - Settings explained: `references/native-agent.md`.
 7. **Check:** the owner sees it online (green dot); a DM gets an answer; an
-   @mention in a channel is accepted by the desktop and answered. Then run the
-   fence test in `references/native-agent.md` as your account.
+   @mention in a channel is accepted by the desktop and answered. Then, as
+   your account, `buzz-fence-test` must print `ok`
+   (`references/native-agent.md`, "The fence"). The service's journal must
+   show no `auto-approving permission` lines: each one is a command that ran
+   outside the sandbox.
 
 Several geniuses on one box: one key, tag, settings pair and service instance
 each. A genius may own sub-agents (it vouches with its own key); those are
@@ -204,6 +207,7 @@ sends an empty message.
 | Desktop: "Could not authorize a mentioned agent" | not vouched, or the profile lacks the tag, or not a channel member | steps 3–5; the profile must carry exactly one `auth` tag |
 | Agent not on the desktop's Agents page | that page lists only agents the desktop runs | expected; it still appears in mentions, search, profiles, members |
 | Online but no answer | harness up, agent failing (often an expired Codex login) | the service's journal on the genius's box; "The Codex login" |
+| Journal shows `auto-approving permission` | Codex asked to escalate and sprig said yes: the command ran unsandboxed | stop the agent; Codex must run behind `codex-fenced` (`references/native-agent.md`, "The fence") |
 | Owner shows as someone else / none | harness started without the tag | `BUZZ_AUTH_TAG` in the harness environment (the log says "owner resolved from BUZZ_AUTH_TAG") |
 | NIP-AM turn-metrics publish 403 | harness newer than the relay | harmless; clears when the relay catches up |
 
