@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# buzz-agent-enable <genius> <account> [--dry-run]
+# buzz-agent-enable --disable <genius>
+#
+# The one root step a genius needs once its two settings files are installed:
+# make buzz-agent@<genius> run as <account> (with that account's HOME, so its
+# Codex uses the account's own ~/.codex login), then enable and start it.
+#
+# Why a drop-in: a systemd template cannot derive User= from the instance, and
+# geniuses on one box may live in different accounts. The template itself runs
+# as `nobody`, which has no key, so an instance without this drop-in fails to
+# start instead of running as anyone who matters.
+set -euo pipefail
+dir=/etc/buzz-agents
+
+if [ "${1:-}" = --disable ]; then
+  name=${2:-}
+  case "$name" in ''|*[!a-z0-9-]*) echo "usage: buzz-agent-enable --disable <genius>" >&2; exit 64;; esac
+  [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 77; }
+  systemctl disable --now "buzz-agent@$name.service"
+  rm -f "/etc/systemd/system/buzz-agent@$name.service.d/account.conf"
+  rmdir --ignore-fail-on-non-empty "/etc/systemd/system/buzz-agent@$name.service.d" 2>/dev/null || true
+  systemctl daemon-reload
+  echo "buzz-agent@$name disabled (settings in $dir and the identity in the account's home are kept)"
+  exit 0
+fi
+
+name=${1:-} account=${2:-} dry=${3:-}
+case "$name" in ''|*[!a-z0-9-]*) echo "usage: buzz-agent-enable <genius> <account> [--dry-run]" >&2; exit 64;; esac
+[ -n "$account" ] || { echo "usage: buzz-agent-enable <genius> <account> [--dry-run]" >&2; exit 64; }
+[ -z "$dry" ] || [ "$dry" = --dry-run ] || { echo "unknown argument: $dry" >&2; exit 64; }
+[ "$(id -u)" -eq 0 ] || [ -n "$dry" ] || { echo "must run as root (or with --dry-run)" >&2; exit 77; }
+
+entry=$(getent passwd "$account") || { echo "no account $account" >&2; exit 67; }
+uid=$(cut -d: -f3 <<<"$entry"); home=$(cut -d: -f6 <<<"$entry")
+[ "$uid" -ne 0 ] || { echo "refusing to run an agent as root" >&2; exit 77; }
+group=$(id -gn "$account")
+
+fail=0
+check() { if eval "$2"; then echo "ok    $1"; else echo "MISSING $1"; fail=1; fi; }
+owned() { [ "$(stat -c '%u' "$1" 2>/dev/null)" = 0 ] && [ -z "$(find "$1" -maxdepth 0 -perm /022)" ]; }
+as() { if [ "$(id -u)" -eq 0 ]; then runuser -u "$account" -- "$@"; else sudo -n -u "$account" "$@" 2>/dev/null; fi; }
+check "$dir/$name.env (root-owned)" "owned '$dir/$name.env'"
+check "$dir/$name.md (root-owned)" "owned '$dir/$name.md'"
+check "$home/.config/buzz/$name.key readable by $account" "as test -r '$home/.config/buzz/$name.key'"
+check "$home/.config/buzz/$name.authtag readable by $account" "as test -r '$home/.config/buzz/$name.authtag'"
+check "$home/.codex/auth.json (the account's Codex login)" "as test -r '$home/.codex/auth.json'"
+check "/usr/local/bin/buzz-acp and codex-acp installed" "[ -x /usr/local/bin/buzz-acp ] && [ -x /usr/local/bin/codex-acp ]"
+
+dropin="/etc/systemd/system/buzz-agent@$name.service.d/account.conf"
+body="# Written by buzz-agent-enable: buzz-agent@$name runs as $account.
+[Service]
+User=$account
+Group=$group
+Environment=HOME=$home"
+if [ -n "$dry" ]; then
+  printf '\nwould write %s:\n%s\n\nthen: systemctl daemon-reload; systemctl enable --now buzz-agent@%s\n' "$dropin" "$body" "$name"
+  exit "$fail"
+fi
+[ "$fail" -eq 0 ] || { echo "not enabling buzz-agent@$name: fix the MISSING items first" >&2; exit 1; }
+install -d -m 0755 "$(dirname "$dropin")"
+printf '%s\n' "$body" > "$dropin.new" && chmod 0644 "$dropin.new" && mv -f "$dropin.new" "$dropin"
+systemctl daemon-reload
+systemctl enable --now "buzz-agent@$name.service"
+sleep 15
+systemctl is-active --quiet "buzz-agent@$name.service" ||
+  { journalctl -u "buzz-agent@$name.service" -n 20 --no-pager >&2; echo "buzz-agent@$name did not stay up" >&2; exit 1; }
+echo "buzz-agent@$name is running as $account"

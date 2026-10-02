@@ -31,7 +31,7 @@ skills/
 | `commit-and-push` | Audit, clean, stage, message, commit, push — the full workflow | 🚧 WIP |
 | `youtube-transcript` | Fetch and clean YouTube video transcripts | 🚧 WIP |
 | `nate-analysis` | Analyze NateBJones content with Opus-level depth | 🚧 WIP |
-| `buzz-genius` | Put a genius on a self-hosted Buzz relay: identity, admission, owner vouching (NIP-OA), a native agent under Buzz's headless harness, etiquette; plus what a host admin prepares once per box (host setup: draft) | ✅ |
+| `buzz-genius` | Put a genius on a self-hosted Buzz relay: identity, admission, owner vouching (NIP-OA), a native agent under Buzz's headless harness, etiquette; plus the host admin's kit that installs and self-upgrades the harness, adapter and CLI on each box | ✅ |
 
 ## Design Philosophy
 

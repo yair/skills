@@ -1,0 +1,26 @@
+# /etc/buzz-agents/host.conf — the buzz-genius host kit's settings for this
+# box. Root-owned. Read by buzz-host-update (Python, KEY=VALUE) and sourced by
+# buzz-notify (shell), so keep to plain KEY=value lines without spaces.
+
+# The relay's running source commit, published by the relay host as one line
+# (40 hex + newline). sprig is upgraded when it changes; while it is unset or
+# does not answer with a commit, sprig follows sprig-latest.
+#RELAY_REVISION_URL=https://relay.example.org/.well-known/buzz-relay-revision
+
+# Who hears about failed upgrades, rollbacks and agents systemd gave up on
+# (with neither set, failures are only logged).
+# Either a command (`cmd <subject>`, body on stdin) or a mail address sent
+# through NOTIFY_SMTP.
+#NOTIFY_CMD=/usr/local/bin/notify-owner
+#NOTIFY_MAILTO=owner@example.org
+NOTIFY_SMTP=smtp://127.0.0.1:25
+#NOTIFY_FROM=buzz-host@host.example.org
+
+# sprig build for this machine (aarch64-unknown-linux-musl on ARM).
+SPRIG_TARGET=x86_64-unknown-linux-musl
+# Keep the previous version of each component for a manual rollback (the
+# adapter is ~450 MB a version, as it bundles Codex). 0 keeps only current.
+KEEP_PREVIOUS=1
+# How long a sprig upgrade waits for a busy agent to go idle before
+# restarting it anyway.
+IDLE_WAIT_MINUTES=60

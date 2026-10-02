@@ -1,0 +1,455 @@
+#!/usr/bin/python3
+"""buzz-host-update -- install and keep upgraded the Buzz pieces a host's
+geniuses run on: sprig (Block's static harness, which is also the `buzz` CLI)
+and the Codex ACP adapter. Root, daily (buzz-host-update.timer), and by hand
+for the first install.
+
+Why: Buzz moves fast, and the owner prefers an occasional breakage to
+chasing upgrade notices across several boxes. So upgrades install
+themselves, verified as golem's pinned installers verify (sha256 of the
+tarball and of every binary against sprig.json; the adapter through npm's
+lockfile integrity), each into its own versioned directory, switched in by
+replacing one `current` symlink and switched back the same way when the
+smoke check fails. Quiet on success; the owner hears only about failures
+(buzz-notify).
+
+    /usr/local/lib/buzz/sprig/<commit12>/      sprig + its personality links
+    /usr/local/lib/buzz/codex-acp/<version>/   package.json, lock, node_modules
+    /usr/local/lib/buzz/<component>/current -> <id>
+    /usr/local/bin/buzz-acp, buzz              -> sprig/current/...
+    /usr/local/bin/codex-acp                   -> codex-acp/current/node_modules/.bin/codex-acp
+
+sprig is the CLI too: Block's desktop .deb carries a glibc build of `buzz`
+that needs glibc >= 2.38 (Debian 12 has 2.36), while sprig is a static musl
+build from the same source, and invoked as `buzz` it is the full CLI.
+
+sprig follows the RELAY, not upstream latest: a harness ahead of the relay is
+what makes NIP-AM publishes fail. With RELAY_REVISION_URL set (the relay host
+publishes its running commit there), sprig is upgraded to the then-current
+sprig-latest whenever that commit changes. Without it, or while it does not
+answer with a commit, sprig follows sprig-latest (the asset is rolling: only
+the newest build can be downloaded at all).
+
+Agents pick up a new adapter or CLI on their next spawn (both are reached
+through the symlinks). A new sprig needs a restart of buzz-agent@*: done
+only when the agent is idle (no adapter process in its cgroup), waiting up
+to IDLE_WAIT_MINUTES, then regardless.
+
+Config: /etc/buzz-agents/host.conf (KEY=VALUE). State: /var/lib/buzz-host.
+  --dry-run          say what would change; touch nothing
+  --only COMPONENT   sprig | codex-acp
+  --retry            forget builds that failed their smoke check here, so the
+                     same upstream build is tried again
+
+Testing: BUZZ_HOST_TEST_ROOT=<dir> puts every path under <dir>, runs without
+root, restarts no agents and sends no mail; BUZZ_HOST_TEST_FAIL=<component>
+makes that component's smoke check fail, to exercise the rollback.
+"""
+import fcntl, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time, urllib.request
+
+TEST = os.environ.get("BUZZ_HOST_TEST_ROOT", "")
+CONF = TEST + "/etc/buzz-agents/host.conf"
+LIB = TEST + "/usr/local/lib/buzz"
+BIN = TEST + "/usr/local/bin"
+STATE = TEST + "/var/lib/buzz-host/state.json"
+LOCK = TEST + "/run/buzz-host-update.lock"
+FAIL = os.environ.get("BUZZ_HOST_TEST_FAIL", "") if TEST else ""
+REPO = "block/buzz"
+ADAPTER = "@agentclientprotocol/codex-acp"
+FAILURES_BEFORE_NOTIFY = 3
+DRY = False
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def conf():
+    c = {"SPRIG_TARGET": "x86_64-unknown-linux-musl", "KEEP_PREVIOUS": "1",
+         "IDLE_WAIT_MINUTES": "60", "RELAY_REVISION_URL": ""}
+    try:
+        for line in open(CONF):
+            m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=(.*)$", line)
+            if m:
+                c[m.group(1)] = m.group(2).strip().strip("'\"")
+    except OSError:
+        pass
+    return c
+
+
+def get(url, raw=False, timeout=30):
+    headers = {"User-Agent": "buzz-host-update"}
+    if url.startswith("https://api.github.com/"):
+        headers["Accept"] = "application/vnd.github+json"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+        body = r.read()
+    return body if raw else json.loads(body)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def rootown(top):
+    if os.geteuid() != 0:
+        return
+    os.lchown(top, 0, 0)
+    for root, dirs, files in os.walk(top):
+        for n in dirs + files:
+            os.lchown(os.path.join(root, n), 0, 0)
+
+
+def notify(subject, body):
+    log(f"notify: {subject}")
+    if TEST:
+        log("  (test: not sent)\n  " + body.replace("\n", "\n  "))
+    elif not DRY:
+        subprocess.run(["/usr/local/sbin/buzz-notify", subject], input=body, text=True, check=False)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.pop("timeout", 600), **kw)
+
+
+# --- the versioned layout --------------------------------------------------
+
+def current(comp):
+    try:
+        return os.readlink(f"{LIB}/{comp}/current")
+    except OSError:
+        return None
+
+
+def point(comp, ident):
+    """Switch <comp>/current to <ident> atomically (symlink + rename)."""
+    tmp = f"{LIB}/{comp}/.current.new"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(ident, tmp)
+    os.replace(tmp, f"{LIB}/{comp}/current")
+
+
+def link_bins():
+    for name, target in (("buzz-acp", f"{LIB}/sprig/current/buzz-acp"),
+                         ("buzz", f"{LIB}/sprig/current/buzz"),
+                         ("codex-acp", f"{LIB}/codex-acp/current/node_modules/.bin/codex-acp")):
+        dst = f"{BIN}/{name}"
+        if os.path.islink(dst) and os.readlink(dst) == target:
+            continue
+        if os.path.exists(dst) and not os.path.islink(dst):
+            raise RuntimeError(f"{dst} exists and is not ours (not a symlink); remove it deliberately")
+        tmp = f"{BIN}/.{name}.new"
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.symlink(target, tmp)
+        os.replace(tmp, dst)
+
+
+def prune(comp, keep_previous, previous):
+    cur = current(comp)
+    keep = {cur, "current"} | ({previous} if keep_previous and previous else set())
+    for d in os.listdir(f"{LIB}/{comp}"):
+        if d not in keep and not d.startswith("."):
+            shutil.rmtree(f"{LIB}/{comp}/{d}", ignore_errors=True)
+            log(f"{comp}: removed old {d}")
+    for d in os.listdir(f"{LIB}/{comp}"):  # staging left by an interrupted run
+        if d.startswith(".stage-"):
+            shutil.rmtree(f"{LIB}/{comp}/{d}", ignore_errors=True)
+
+
+# --- sprig -----------------------------------------------------------------
+
+def relay_revision(c):
+    url = c["RELAY_REVISION_URL"]
+    if not url:
+        return None, "no RELAY_REVISION_URL"
+    try:
+        body = get(url, raw=True, timeout=15).decode().strip()
+    except Exception as e:
+        return None, f"{url}: {e}"
+    if not re.fullmatch(r"[0-9a-f]{40}", body):
+        return None, f"{url}: not a commit"
+    return body, None
+
+
+def sprig_plan(c, state):
+    """-> (reason, action, relay revision); action None (no change) or 'latest'."""
+    asset = f"sprig-{c['SPRIG_TARGET']}.tar.gz"
+    up = get(f"https://github.com/{REPO}/releases/download/sprig-latest/{asset}.sha256", raw=True).decode().split()[0]
+    have = current("sprig")
+    rev, why = relay_revision(c)
+    if have and up == state.get("sprig_tarball_sha256"):
+        if rev and rev != state.get("sprig_relay_revision") and not DRY:
+            state["sprig_relay_revision"] = rev  # relay moved, sprig-latest has not: nothing to install
+        return f"sprig-latest is the installed build ({have})", None, rev
+    if up == state.get("refused", {}).get("sprig"):
+        return f"sprig-latest {up[:12]} already failed its smoke check here; waiting for a new build", None, rev
+    if rev:
+        if have and state.get("sprig_relay_revision") == rev:
+            return f"relay still at {rev[:7]}; sprig {have} stays", None, rev
+        return f"relay at {rev[:7]} (sprig followed {str(state.get('sprig_relay_revision'))[:7]})", "latest", rev
+    return f"relay revision unavailable ({why}); following sprig-latest", "latest", None
+
+
+def sprig_install(c):
+    """Download, verify and unpack sprig-latest into a new versioned dir. -> (ident, tarball sha256)."""
+    asset = f"sprig-{c['SPRIG_TARGET']}.tar.gz"
+    base = f"https://github.com/{REPO}/releases/download/sprig-latest/{asset}"
+    os.makedirs(f"{LIB}/sprig", exist_ok=True)
+    stage = tempfile.mkdtemp(prefix=".stage-", dir=f"{LIB}/sprig")
+    try:
+        tgz = f"{stage}/{asset}"
+        with open(tgz, "wb") as f:
+            f.write(get(base, raw=True, timeout=600))
+        want = get(base + ".sha256", raw=True).decode().split()[0]
+        got = sha256(tgz)
+        if got != want:  # the rolling asset may be replaced between the two reads: retry next run
+            raise RuntimeError(f"sprig tarball sha256 {got} != published {want}")
+        tree = f"{stage}/tree"
+        os.mkdir(tree)
+        with tarfile.open(tgz) as t:
+            for m in t.getmembers():
+                bad = m.name.startswith("/") or ".." in m.name.split("/")
+                if m.issym() or m.islnk():
+                    bad |= m.linkname.startswith("/") or ".." in m.linkname.split("/")
+                if bad or not (m.isfile() or m.isdir() or m.issym()):
+                    raise RuntimeError(f"unexpected member in tarball: {m.name}")
+            t.extractall(tree)
+        meta = json.load(open(f"{tree}/sprig.json"))
+        for b in meta["binaries"]:
+            if sha256(f"{tree}/{b['name']}") != b["sha256"]:
+                raise RuntimeError(f"sprig {b['name']}: sha256 differs from sprig.json")
+        if not os.path.lexists(f"{tree}/buzz"):
+            os.symlink("sprig", f"{tree}/buzz")
+        ident = meta["git_sha"][:12]
+        rootown(tree)
+        os.chmod(tree, 0o755)
+        dest = f"{LIB}/sprig/{ident}"
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        os.rename(tree, dest)
+        return ident, want, meta["git_sha"]
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def sprig_smoke():
+    if FAIL == "sprig":
+        raise RuntimeError("test: smoke failure requested")
+    r = run([f"{BIN}/buzz", "--help"], timeout=30)
+    if r.returncode != 0 or "Buzz CLI" not in r.stdout:
+        raise RuntimeError(f"`buzz --help` failed: {r.returncode} {r.stderr.strip()[:200]}")
+    r = run([f"{BIN}/buzz-acp", "--help"], timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"`buzz-acp --help` failed: {r.returncode} {r.stderr.strip()[:200]}")
+
+
+# --- the Codex ACP adapter -------------------------------------------------
+
+def adapter_plan(c, state):
+    up = get(f"https://registry.npmjs.org/{ADAPTER}/latest")["version"]
+    have = current("codex-acp")
+    if have == up:
+        return f"codex-acp {have} is npm latest", None
+    if up == state.get("refused", {}).get("codex-acp"):
+        return f"codex-acp {up} already failed its smoke check here; waiting for a newer one", None
+    return f"codex-acp {have or 'absent'} -> {up}", up
+
+
+def adapter_install(version):
+    """Resolve a lockfile for exactly <version> and `npm ci` it, scripts off."""
+    os.makedirs(f"{LIB}/codex-acp", exist_ok=True)
+    stage = tempfile.mkdtemp(prefix=".stage-", dir=f"{LIB}/codex-acp")
+    try:
+        with open(f"{stage}/package.json", "w") as f:
+            json.dump({"private": True, "dependencies": {ADAPTER: version}}, f)
+        env = dict(os.environ, npm_config_cache=f"{stage}/.npm", npm_config_update_notifier="false")
+        for cmd in (["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
+                    ["npm", "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"]):
+            r = run(cmd, cwd=stage, env=env, timeout=900)
+            if r.returncode != 0:
+                raise RuntimeError(f"{' '.join(cmd[:2])}: {r.stderr.strip()[-400:]}")
+        shutil.rmtree(f"{stage}/.npm", ignore_errors=True)
+        lock = json.load(open(f"{stage}/package-lock.json"))
+        locked = lock["packages"][f"node_modules/{ADAPTER}"]["version"]
+        if locked != version:
+            raise RuntimeError(f"lockfile resolved {locked}, wanted {version}")
+        r = run([f"{stage}/node_modules/.bin/codex-acp", "--version"], timeout=60)
+        if r.returncode != 0 or r.stdout.split()[-1:] != [version]:
+            raise RuntimeError(f"codex-acp --version says {r.stdout.strip()!r}, wanted {version}")
+        rootown(stage)
+        os.chmod(stage, 0o755)
+        dest = f"{LIB}/codex-acp/{version}"
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        os.rename(stage, dest)
+        return version
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def adapter_smoke(version):
+    if FAIL == "codex-acp":
+        raise RuntimeError("test: smoke failure requested")
+    r = run([f"{BIN}/codex-acp", "--version"], timeout=60)
+    if r.returncode != 0 or r.stdout.split()[-1:] != [version]:
+        raise RuntimeError(f"codex-acp --version through {BIN} says {r.stdout.strip()!r}")
+
+
+# --- agents ----------------------------------------------------------------
+
+def agents():
+    if TEST:
+        return []
+    r = run(["systemctl", "list-units", "--type=service", "--state=active", "--plain", "--no-legend",
+             "buzz-agent@*.service"], timeout=30)
+    return [l.split()[0] for l in r.stdout.splitlines() if l.strip()]
+
+
+def busy(unit):
+    """An agent is busy while its cgroup holds more than the harness itself."""
+    cg = run(["systemctl", "show", "-p", "ControlGroup", "--value", unit], timeout=30).stdout.strip()
+    try:
+        procs = open(f"/sys/fs/cgroup{cg}/cgroup.procs").read().split()
+    except OSError:
+        return False
+    return len(procs) > 1
+
+
+def restart_agents(c):
+    units = agents()
+    deadline = time.time() + 60 * int(c["IDLE_WAIT_MINUTES"])
+    pending = list(units)
+    while pending:
+        for u in list(pending):
+            if not busy(u) or time.time() >= deadline:
+                log(f"restarting {u}" + (" (still busy, waited long enough)" if busy(u) else ""))
+                run(["systemctl", "restart", u], timeout=180)
+                pending.remove(u)
+        if pending:
+            time.sleep(30)
+    return units
+
+
+def agents_healthy(units):
+    if not units:
+        return
+    before = {u: run(["systemctl", "show", "-p", "NRestarts", "--value", u]).stdout.strip() for u in units}
+    time.sleep(45)
+    bad = [u for u in units
+           if run(["systemctl", "is-active", u]).stdout.strip() != "active"
+           or run(["systemctl", "show", "-p", "NRestarts", "--value", u]).stdout.strip() != before[u]]
+    if bad:
+        raise RuntimeError("not running steadily after the switch: " + ", ".join(bad))
+
+
+# --- main ------------------------------------------------------------------
+
+def upgrade(comp, c, state):
+    """One component: plan, install, switch, smoke, roll back. Raises on a check failure."""
+    keep = c["KEEP_PREVIOUS"] not in ("0", "no", "false")
+    if comp == "sprig":
+        reason, action, rev = sprig_plan(c, state)
+    else:
+        (reason, action), rev = adapter_plan(c, state), None
+    log(f"{comp}: {reason}")
+    if not action or DRY:
+        return
+    previous = current(comp)
+    try:
+        if comp == "sprig":
+            ident, tarball, commit = sprig_install(c)
+        else:
+            ident = adapter_install(action)
+    except Exception as e:
+        notify(f"Buzz on {os.uname().nodename}: {comp} upgrade not installed",
+               f"{reason}\nThe new build failed verification or installation; {previous or 'nothing'} stays in place.\n\n{e}\n")
+        raise
+    if ident == previous:
+        log(f"{comp}: {ident} already current")
+    else:
+        point(comp, ident)
+        link_bins()
+        try:
+            if comp == "sprig":
+                sprig_smoke()
+                agents_healthy(restart_agents(c))
+            else:
+                adapter_smoke(ident)
+            log(f"{comp}: now {ident} (was {previous or 'absent'})")
+        except Exception as e:
+            if previous:
+                point(comp, previous)
+                if comp == "sprig":
+                    restart_agents(dict(c, IDLE_WAIT_MINUTES="0"))
+                what = f"rolled back to {previous}"
+            else:
+                os.unlink(f"{LIB}/{comp}/current")
+                what = "nothing to roll back to; removed"
+            shutil.rmtree(f"{LIB}/{comp}/{ident}", ignore_errors=True)
+            notify(f"Buzz on {os.uname().nodename}: {comp} {ident} failed its smoke check, {what}",
+                   f"{reason}\n{comp} {ident} was installed and switched in, then failed:\n\n{e}\n\n{what}.\n"
+                   "It will be tried again when upstream moves.\n")
+            state.setdefault("refused", {})[comp] = tarball if comp == "sprig" else ident
+            return
+    if comp == "sprig":
+        state["sprig_tarball_sha256"] = tarball
+        state["sprig_commit"] = commit
+        if rev:
+            state["sprig_relay_revision"] = rev
+    prune(comp, keep, previous)
+
+
+def main():
+    global DRY
+    args = sys.argv[1:]
+    DRY = "--dry-run" in args
+    only = args[args.index("--only") + 1] if "--only" in args else None
+    if os.geteuid() != 0 and not DRY and not TEST:
+        print("buzz-host-update must run as root (or with --dry-run)", file=sys.stderr)
+        return 77
+    c = conf()
+    try:
+        state = json.load(open(STATE))
+    except (OSError, ValueError):
+        state = {}
+    if TEST:
+        for d in (LIB, BIN, os.path.dirname(STATE), os.path.dirname(LOCK)):
+            os.makedirs(d, exist_ok=True)
+    lock = open(LOCK if os.geteuid() == 0 or TEST else os.devnull, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if "--retry" in args:
+        state.pop("refused", None)
+    errors = []
+    for comp in ("sprig", "codex-acp"):
+        if only and comp != only:
+            continue
+        try:
+            upgrade(comp, c, state)
+        except Exception as e:
+            errors.append(f"{comp}: {e}")
+            print(f"{comp}: {e}", file=sys.stderr)
+    if not DRY:
+        try:
+            link_bins()
+        except Exception as e:
+            errors.append(f"links: {e}")
+        state["failures"] = state.get("failures", 0) + 1 if errors else 0
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE + ".tmp", "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(STATE + ".tmp", STATE)
+        if errors and state["failures"] == FAILURES_BEFORE_NOTIFY:
+            notify(f"Buzz on {os.uname().nodename}: upgrade checks failing",
+                   f"{state['failures']} consecutive runs of buzz-host-update had failures:\n\n"
+                   + "\n".join(errors) + "\n\njournalctl -u buzz-host-update\n")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

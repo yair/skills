@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# buzz-host-install [--check] — install the buzz-genius host kit from this
+# skill checkout onto the system paths it runs from (root, once per box, and
+# again after pulling a new version of the skill).
+#
+# Nothing on the system runs out of the checkout: every file is copied,
+# root-owned, staged beside its destination and renamed into place, so a
+# later edit to the checkout changes nothing until this is run again.
+# --check compares the installed copies with the checkout and changes nothing;
+# a clean --check after an install is the postcondition.
+#
+# After a first install: edit /etc/buzz-agents/host.conf, then run
+# `buzz-host-update` once by hand (it installs sprig and the adapter); the
+# daily timer keeps them upgraded from then on.
+set -euo pipefail
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+skill=$(dirname "$here")
+check=0; [ "${1:-}" = --check ] && check=1
+
+# mode | source (relative to the skill) | destination
+manifest="
+0755|host/buzz-host-update|/usr/local/sbin/buzz-host-update
+0755|host/buzz-agent-enable|/usr/local/sbin/buzz-agent-enable
+0755|host/buzz-notify|/usr/local/sbin/buzz-notify
+0755|host/buzz-agent|/usr/local/bin/buzz-agent
+0755|scripts/buzz-as|/usr/local/bin/buzz-as
+0755|scripts/buzz-keygen|/usr/local/bin/buzz-keygen
+0755|scripts/buzz-vouch|/usr/local/bin/buzz-vouch
+0755|scripts/codex-log-trim|/usr/local/bin/codex-log-trim
+0644|host/systemd/buzz-agent@.service|/etc/systemd/system/buzz-agent@.service
+0644|host/systemd/buzz-notify@.service|/etc/systemd/system/buzz-notify@.service
+0644|host/systemd/buzz-host-update.service|/etc/systemd/system/buzz-host-update.service
+0644|host/systemd/buzz-host-update.timer|/etc/systemd/system/buzz-host-update.timer
+"
+
+if [ "$check" = 1 ]; then
+  drift=0
+  while IFS='|' read -r mode src dst; do
+    [ -n "$src" ] || continue
+    if ! cmp -s "$skill/$src" "$dst"; then echo "DIFFERS $dst"; drift=1
+    elif [ "$(stat -c '%a %U:%G' "$dst")" != "${mode#0} root:root" ]; then echo "MODE    $dst ($(stat -c '%a %U:%G' "$dst"))"; drift=1
+    else echo "ok      $dst"; fi
+  done <<<"$manifest"
+  for d in /etc/buzz-agents; do
+    [ "$(stat -c '%a %U' "$d" 2>/dev/null)" = "755 root" ] && echo "ok      $d/" || { echo "MISSING $d/ (0755 root)"; drift=1; }
+  done
+  [ -f /etc/buzz-agents/host.conf ] && echo "ok      /etc/buzz-agents/host.conf" || { echo "MISSING /etc/buzz-agents/host.conf"; drift=1; }
+  systemctl is-enabled --quiet buzz-host-update.timer && echo "ok      buzz-host-update.timer enabled" || { echo "OFF     buzz-host-update.timer"; drift=1; }
+  exit "$drift"
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "buzz-host-install must run as root (or --check)" >&2; exit 77; }
+for t in python3 node npm sqlite3 curl; do
+  command -v "$t" >/dev/null || { echo "missing prerequisite: $t" >&2; exit 1; }
+done
+node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' ||
+  { echo "the Codex adapter needs Node >= 20 (have $(node --version))" >&2; exit 1; }
+
+# --- validate every source before touching anything ---
+while IFS='|' read -r mode src dst; do
+  [ -n "$src" ] || continue
+  f=$skill/$src
+  [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
+  case "$(head -1 "$f")" in
+    *python3*) python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$f" ;;
+    *bash*)    bash -n "$f" ;;
+  esac || { echo "does not parse: $f" >&2; exit 1; }
+done <<<"$manifest"
+
+# --- stage beside each destination, then rename into place ---
+while IFS='|' read -r mode src dst; do
+  [ -n "$src" ] || continue
+  install -m "$mode" -o root -g root "$skill/$src" "$(dirname "$dst")/.$(basename "$dst").new"
+  mv -f "$(dirname "$dst")/.$(basename "$dst").new" "$dst"
+done <<<"$manifest"
+
+install -d -m 0755 -o root -g root /etc/buzz-agents /usr/local/lib/buzz
+if [ ! -f /etc/buzz-agents/host.conf ]; then
+  install -m 0644 -o root -g root "$here/host.conf.example" /etc/buzz-agents/host.conf
+  echo "wrote /etc/buzz-agents/host.conf from the example: edit it (relay, notifications)"
+fi
+systemctl daemon-reload
+# Advisory: a template cannot be verified on its own, and systemd-analyze also
+# flags harmless things in unrelated units; read what it says, do not gate on it.
+systemd-analyze verify /etc/systemd/system/buzz-host-update.service /etc/systemd/system/buzz-host-update.timer || true
+systemctl enable --now buzz-host-update.timer
+echo "installed the buzz-genius host kit from $skill ($(git -C "$skill" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
+echo "next: review /etc/buzz-agents/host.conf, then: buzz-host-update"

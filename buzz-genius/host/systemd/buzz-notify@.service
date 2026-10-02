@@ -1,0 +1,8 @@
+[Unit]
+# OnFailure target for the Buzz host kit's units: tells the owner (buzz-notify,
+# configured in /etc/buzz-agents/host.conf) which unit failed, with its journal.
+Description=Notify the owner that %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/buzz-notify --unit %i

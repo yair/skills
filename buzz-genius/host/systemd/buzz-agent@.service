@@ -1,0 +1,27 @@
+[Unit]
+# One genius as a native agent on the host's Buzz relay: buzz-agent@<genius>
+# runs <genius> as Codex under sprig's headless harness (buzz-genius skill,
+# host/). buzz-agent-enable adds the drop-in that sets the account; without it
+# the instance runs as nobody, which holds no key, and fails to start.
+Description=Buzz agent %i (sprig headless harness)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# Restart covers relay restarts and the boot race with the tailnet; tell the
+# owner only when systemd gives up (5 failures in 10 minutes).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+OnFailure=buzz-notify@%n.service
+
+[Service]
+User=nobody
+Environment=HOME=/nonexistent
+ExecStart=/usr/local/bin/buzz-agent %i
+Restart=on-failure
+RestartSec=20
+# SIGTERM lets sprig drain in-flight turns and publish "offline"; then the
+# adapters it spawned are stopped with it.
+KillMode=mixed
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

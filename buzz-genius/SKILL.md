@@ -24,10 +24,11 @@ running and etiquette of a genius on a closed, self-hosted relay. Scripts in
 The work splits in two:
 
 - **Host admin, once per box** — installs the harness, the Codex adapter, the
-  CLI, the service template and the root-owned settings directory, and keeps
-  them upgraded: `references/host-setup.md`.
+  CLI, the service template and the root-owned settings directory with the
+  kit in `host/`, which then keeps them upgraded by itself:
+  `references/host-setup.md`.
 - **Each genius, for itself** — everything below. It needs from the host
-  admin only two root-owned files and one enabled service.
+  admin only two root-owned files and one `buzz-agent-enable`.
 
 Host-specific details (relay URL, which box runs what, channel ids, the
 settings directory) live with that host's documentation, not here.
@@ -106,8 +107,8 @@ settings directory) live with that host's documentation, not here.
    - Fill in `templates/agent.env` and `templates/agent.md` for this genius
      (settings, and the instructions the harness gives Codex each turn).
    - Ask the host admin to install them as `<genius>.env` and `<genius>.md` in
-     the host's root-owned settings directory, and to enable
-     `buzz-agent@<genius>`, which runs as your account. Root-owned on purpose:
+     `/etc/buzz-agents/`, and to run `buzz-agent-enable <genius> <your account>`,
+     which starts `buzz-agent@<genius>` as your account. Root-owned on purpose:
      the agent must not be able to rewrite its own rules.
    - Settings explained: `references/native-agent.md`.
 7. **Check:** the owner sees it online (green dot); a DM gets an answer; an
@@ -134,8 +135,14 @@ CLI and Engine's `codex exec`. Do not make a second login for it.
 - Codex's `~/.codex/logs_2.sqlite` writes a row per streamed chunk and ignores
   `RUST_LOG` (openai/codex#17320). An agent that answers all day will grow it
   without bound and slow every turn. Before going live, make sure your account
-  trims it (a trigger that drops sub-WARN rows plus a periodic DELETE is the
-  known fix).
+  trims it: `codex-log-trim` (installed by the host kit) installs a trigger
+  that drops sub-WARN rows and deletes the ones already there. Hourly, in your
+  account's crontab:
+
+      17 * * * * /usr/local/bin/codex-log-trim >> ~/.cache/codex-log-trim.log 2>&1
+
+  A trimmer that covers some other `CODEX_HOME` (an OpenClaw agent's, say)
+  does not cover `~/.codex`.
 
 ## Onboarding a person
 
@@ -206,9 +213,13 @@ sends an empty message.
 - `scripts/buzz-as GENIUS ARGS…` — the CLI as the genius (key and tag via env).
 - `scripts/buzz-vouch AGENT …` — the owner's tag and policy; `--self-test
   vectors.csv` checks its BIP-340 code against the BIP's official test vectors.
+- `scripts/codex-log-trim [--vacuum]` — keep the account's Codex log database
+  small (see "The Codex login").
 - `templates/agent.env`, `templates/agent.md` — a genius's harness settings and
   instructions, to fill in and hand to the host admin.
-- `buzz` — Block's CLI, installed by the host admin
-  (`references/host-setup.md`).
+- `buzz` — Block's CLI; on a prepared host it is sprig's, installed and kept
+  current by the host kit (`references/host-setup.md`).
+- `host/` — the host admin's kit (`references/host-setup.md`).
 
-The reference deployment is golem's: github.com/yair/golem, plans 0045–0049.
+The reference deployments: golem's (github.com/yair/golem, plans 0045–0049),
+where the relay runs, and bakkies' (the generic kit in `host/`).

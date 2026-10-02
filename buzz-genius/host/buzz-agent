@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# buzz-agent <genius> — run one genius as a native agent on the host's Buzz
+# relay, under sprig's headless harness. Started by buzz-agent@<genius>, as
+# the account that owns the genius's home (buzz-agent-enable sets it).
+#
+# Settings and instructions are root-owned, so the agent cannot rewrite its
+# own rules; this refuses to start if they are not:
+#   /etc/buzz-agents/<genius>.env   harness and adapter settings (no secrets)
+#   /etc/buzz-agents/<genius>.md    the agent's instructions
+# Identity, in the account's home:
+#   ~/.config/buzz/<genius>.key       private key (hex, mode 600)
+#   ~/.config/buzz/<genius>.authtag   NIP-OA tag from the owner (buzz-vouch; public)
+# Both reach sprig through its environment, never argv. Workspace (the only
+# place the agent may write): ~/.buzz/<genius>.
+#
+# Adapted from golem's scripts/buzz-agent (github.com/yair/golem, plan 0048).
+set -euo pipefail
+name=${1:-}
+case "$name" in ''|*[!a-z0-9-]*) echo "usage: buzz-agent <genius>  (lowercase letters, digits, -)" >&2; exit 64;; esac
+[ "$(id -u)" -ne 0 ] || { echo "buzz-agent: refusing to run an agent as root" >&2; exit 77; }
+dir=/etc/buzz-agents
+conf=$dir/$name.env
+instructions=$dir/$name.md
+key=$HOME/.config/buzz/$name.key
+tag=$HOME/.config/buzz/$name.authtag
+for f in "$conf" "$instructions" "$key" "$tag"; do
+  [ -r "$f" ] || { echo "buzz-agent: cannot read $f" >&2; exit 78; }
+done
+for f in "$dir" "$conf" "$instructions"; do
+  # root-owned and writable by root alone, or the agent could edit its rules
+  [ "$(stat -c '%u' "$f")" = 0 ] && [ -z "$(find "$f" -maxdepth 0 -perm /022)" ] ||
+    { echo "buzz-agent: $f must be root-owned and not group/world-writable" >&2; exit 78; }
+done
+
+set -a
+# shellcheck source=/dev/null
+. "$conf"
+set +a
+BUZZ_PRIVATE_KEY=$(cat "$key")
+BUZZ_AUTH_TAG=$(cat "$tag")
+export BUZZ_PRIVATE_KEY BUZZ_AUTH_TAG
+export BUZZ_ACP_SYSTEM_PROMPT_FILE=$instructions NO_COLOR=1
+
+work=$HOME/.buzz/$name
+mkdir -p "$work"
+cd "$work"
+exec /usr/local/bin/buzz-acp

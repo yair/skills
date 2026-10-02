@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# buzz-notify <subject>        body on stdin
+# buzz-notify --unit <unit>    for OnFailure=buzz-notify@%n.service
+#
+# How the host kit tells the owner something failed. Configured in
+# /etc/buzz-agents/host.conf, first match wins:
+#   NOTIFY_CMD=/path/to/cmd   run as `cmd <subject>`, body on stdin (a host's
+#                             own notifier, e.g. golem's notify-jay)
+#   NOTIFY_MAILTO=addr        mail through NOTIFY_SMTP (default smtp://127.0.0.1:25)
+#                             from NOTIFY_FROM (default buzz-host@<hostname -f>)
+# With neither, it only logs. It never fails its caller.
+set -uo pipefail
+conf=/etc/buzz-agents/host.conf
+NOTIFY_CMD= NOTIFY_MAILTO= NOTIFY_SMTP=smtp://127.0.0.1:25 NOTIFY_FROM=
+# shellcheck source=/dev/null
+[ -r "$conf" ] && . "$conf"
+host=$(hostname)
+
+if [ "${1:-}" = --unit ]; then
+  unit=${2:?unit}
+  subject="$unit failed on $host"
+  body=$(systemctl status --no-pager -n 0 "$unit" 2>&1; echo; journalctl -u "$unit" -n 40 --no-pager 2>&1)
+else
+  subject=${1:?subject}
+  body=$(cat)
+fi
+echo "buzz-notify: $subject"
+
+if [ -n "$NOTIFY_CMD" ]; then
+  printf '%s\n' "$body" | "$NOTIFY_CMD" "$subject" || echo "buzz-notify: $NOTIFY_CMD failed" >&2
+elif [ -n "$NOTIFY_MAILTO" ]; then
+  from=${NOTIFY_FROM:-buzz-host@$(hostname -f)}
+  curl --silent --show-error --max-time 30 --mail-from "$from" --mail-rcpt "$NOTIFY_MAILTO" \
+       --url "$NOTIFY_SMTP" -T - <<EOF || echo "buzz-notify: mail to $NOTIFY_MAILTO failed" >&2
+From: $from
+To: $NOTIFY_MAILTO
+Subject: $subject
+Content-Type: text/plain; charset=utf-8
+
+$body
+EOF
+else
+  echo "buzz-notify: no NOTIFY_CMD or NOTIFY_MAILTO in $conf; logged only" >&2
+  printf '%s\n' "$body"
+fi
+exit 0

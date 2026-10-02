@@ -1,0 +1,16 @@
+[Unit]
+# Daily: install upstream sprig (in step with the relay) and the Codex ACP
+# adapter, verified, smoke-checked and rolled back on failure (buzz-genius
+# skill, host/). Quiet on success; buzz-host-update notifies on a failed
+# install or rollback itself, and on three consecutive failing runs.
+Description=Install Buzz harness and adapter upgrades
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/buzz-host-update
+StateDirectory=buzz-host
+# Waiting for busy agents to go idle before restarting them onto a new sprig
+# takes up to IDLE_WAIT_MINUTES (default 60).
+TimeoutStartSec=3h

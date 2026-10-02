@@ -1,89 +1,109 @@
 # Preparing a host for its geniuses (host admin, once per box)
 
-> **Draft.** The pattern below is golem's (github.com/yair/golem, plans
-> 0048–0049). A second host is being set up from it now; this file and a
-> generic `host/` kit (installers, launcher, unit, upgrader) will be
-> completed from what that install actually needed. Until then, adapt
-> golem's scripts and record every golem-specific value you had to change.
-
 The goal: after this, any genius on the box enrols itself with the steps in
-SKILL.md, and needs from you only two root-owned files and one enabled
-service instance.
+SKILL.md, and needs from you only two root-owned files and one
+`buzz-agent-enable`.
+
+The kit is `host/` in this skill. Nothing runs out of the skill checkout:
+`buzz-host-install` copies everything, root-owned, onto system paths, and
+`buzz-host-update` installs and upgrades the Buzz pieces themselves. It was
+adapted from golem's scripts (github.com/yair/golem, plans 0048–0049) on
+bakkies, a Debian 12 box; bakkies-docker `plans/025` lists every change.
 
 ## Before installing
 
 - The relay is reachable from this host on 443 (SKILL.md, "Before you
   start"). On a tailnet, the ACL must let this host reach the relay host's
   80/443, in both address families.
-- Node ≥ 20 for the adapter, available to root.
+- Root has `python3`, `node` ≥ 20 with `npm`, `sqlite3` and `curl`.
+- Disk: about 50 MB for sprig and about 450 MB for each adapter version (it
+  bundles its own Codex), times two while the previous one is kept.
 
-## What to install (all root-owned)
+## Install
 
-- **sprig** (`buzz-acp`, plus `buzz-agent` and `buzz-dev-mcp`, chosen by
-  `argv[0]`): download `sprig-latest`, verify the tarball's `.sha256` and each
-  binary against `sprig.json`, keep a copy (the asset is rolling; only the
-  newest build can be downloaded again), install to e.g. `/opt/<site>/sprig`.
-- **Codex adapter**: `@agentclientprotocol/codex-acp` (npm; Buzz requires ≥
-  1.10; bundles its own Codex). Pin it with a lockfile and install with
-  `npm ci --omit=dev --ignore-scripts`; check `codex-acp --version` against
-  the lockfile.
-- **buzz CLI**: Block ships it only inside the desktop package; extract
-  `usr/bin/buzz` from the release `.deb`
-  (`dpkg-deb -x Buzz_<ver>_amd64.deb x && install x/usr/bin/buzz /usr/local/bin/`),
-  checking the release asset's sha256.
-- **The skill's scripts** on the system path: `buzz-as`, `buzz-keygen`,
-  `buzz-vouch`.
-- **Settings directory** e.g. `/etc/<site>/buzz-agents/`, holding each
-  genius's `<genius>.env` and `<genius>.md` (from the skill's `templates/`,
-  filled in by the genius). Root-owned so the agent, which runs as its home
-  account, cannot rewrite its own rules.
-- **Launcher** `buzz-agent <genius>`: check the env file, instructions, key and
-  tag are readable; `set -a` and source the env file; export
-  `BUZZ_PRIVATE_KEY` and `BUZZ_AUTH_TAG` from
-  `~/.config/buzz/<genius>.{key,authtag}` (environment only, never argv);
-  set `BUZZ_ACP_SYSTEM_PROMPT_FILE` to the `.md`; `cd ~/.buzz/<genius>` (its
-  workspace, created if missing); `exec buzz-acp`.
-- **Service template** `buzz-agent@.service`: `ExecStart=<launcher> %i`,
-  `Restart=on-failure` with a start limit, `KillMode=mixed` and a generous
-  `TimeoutStopSec` (SIGTERM lets the harness drain and publish "offline"),
-  a failure notifier, ordered after the network (and tailscale).
+    sudo <skill>/host/buzz-host-install          # the kit's own files
+    sudoedit /etc/buzz-agents/host.conf          # relay revision URL, notifications
+    sudo buzz-host-update                        # sprig and the adapter, first time
+    sudo <skill>/host/buzz-host-install --check  # postcondition: every line ok
+
+Run `buzz-host-install` again after pulling a new version of the skill.
+
+What lands where:
+
+| Path | What |
+|---|---|
+| `/usr/local/lib/buzz/sprig/<commit12>/` | sprig, Block's static multicall binary: `buzz-acp` (the harness), `buzz-agent`, `buzz-dev-mcp`, and the **`buzz` CLI** |
+| `/usr/local/lib/buzz/codex-acp/<version>/` | `@agentclientprotocol/codex-acp` with its lockfile and `node_modules` |
+| `/usr/local/lib/buzz/<component>/current` | the active version, switched by rename |
+| `/usr/local/bin/buzz`, `buzz-acp`, `codex-acp` | links through `current` |
+| `/usr/local/bin/buzz-agent` | the launcher `buzz-agent@.service` runs |
+| `/usr/local/bin/buzz-as`, `buzz-keygen`, `buzz-vouch`, `codex-log-trim` | this skill's scripts, for the geniuses |
+| `/usr/local/sbin/buzz-host-update`, `buzz-agent-enable`, `buzz-notify` | root's tools |
+| `/etc/systemd/system/buzz-agent@.service`, `buzz-notify@.service`, `buzz-host-update.{service,timer}` | units |
+| `/etc/buzz-agents/host.conf`, `<genius>.env`, `<genius>.md` | settings, root-owned: the agents must not rewrite their own rules |
+| `/var/lib/buzz-host/state.json` | the updater's memory |
+
+**Why the CLI comes from sprig.** Block ships `buzz` only inside the desktop
+`.deb`, built against glibc ≥ 2.38, so it does not start on Debian 12 (2.36).
+sprig is a static musl build of the same source; invoked as `buzz` it is the
+full CLI. It is also always in step with the harness.
+
+## Upgrades install themselves
+
+The owner prefers an occasional breakage to chasing upgrade notices for four
+fast-moving repositories over several boxes. So `buzz-host-update.timer`
+runs daily, and each upgrade is verified, reversible, and quiet unless it
+fails:
+
+- **The adapter**: npm's latest, resolved into a lockfile for exactly that
+  version and installed with `npm ci --omit=dev --ignore-scripts`; checked
+  with `codex-acp --version`. Agents pick it up on their next spawn.
+- **sprig** (the harness and the CLI): in step with the **relay**, not with
+  upstream latest; a harness ahead of the relay is what makes NIP-AM publishes
+  fail. The relay host publishes its running commit as one line at
+  `RELAY_REVISION_URL` (e.g. `https://<relay>/.well-known/buzz-relay-revision`);
+  when that changes, the then-current `sprig-latest` is installed, verified
+  against its `.sha256` and every binary against `sprig.json`. Without the
+  URL, or while it does not answer with a commit, sprig follows sprig-latest
+  (the asset is rolling: only the newest build can be downloaded at all).
+  Running agents are restarted onto it once idle (no adapter process in the
+  service's cgroup), waiting up to `IDLE_WAIT_MINUTES`; a restart interrupts
+  turns and replays at most 15 minutes of missed mentions.
+- **After a switch**, a smoke check: `buzz --help` and `buzz-acp --help` (and
+  the agents come back and stay up), or `codex-acp --version`. On failure the
+  `current` link goes back to the previous version, the failed build is
+  removed and remembered, and it is not tried again until upstream moves
+  (`buzz-host-update --retry` overrides).
+- **Notifications on failure only**: an install that failed verification, a
+  rollback, three consecutive failing runs, or an agent systemd gave up on
+  (`OnFailure=buzz-notify@`). `host.conf` sets the channel: `NOTIFY_CMD`
+  (the host's own notifier) or `NOTIFY_MAILTO` (local SMTP).
+
+`buzz-host-update --dry-run` says what it would change. To try the kit
+without root, `BUZZ_HOST_TEST_ROOT=<dir> buzz-host-update` puts every path
+under `<dir>`, restarts nothing and sends nothing; `BUZZ_HOST_TEST_FAIL=sprig`
+(or `codex-acp`) forces a smoke failure to exercise the rollback.
 
 ## Which account an instance runs as
 
 Each `buzz-agent@<genius>` runs as the account that owns that genius's home,
 with that account's `HOME`, so its Codex uses that account's existing
-`~/.codex` login (SKILL.md, "The Codex login"). On a box where every genius
-lives in one account, `User=` in the template is enough; where geniuses live
-in several accounts, set the user per instance (e.g. a drop-in
-`buzz-agent@<genius>.service.d/user.conf`).
+`~/.codex` login (SKILL.md, "The Codex login"). The template runs as
+`nobody`, which holds no key, so an instance fails until
+`buzz-agent-enable <genius> <account>` has written its drop-in.
 
-Each such account needs the `logs_2.sqlite` mitigation (openai/codex#17320)
-for `~/.codex` before its agent goes live.
-
-## Upgrades: they install themselves
-
-Buzz moves fast; the owner prefers an occasional breakage to chasing upgrade
-notices. So upgrades install themselves, verified and reversible:
-
-- The adapter and the CLI: install a new upstream version when it appears,
-  verified as at first install.
-- sprig: in step with the **relay**, not with upstream latest (a harness
-  ahead of the relay is what makes NIP-AM publishes fail). Upgrade it when
-  the relay updates.
-- After an install: a smoke check (versions; agents come back online);
-  on failure, roll back to the kept copy. Restart agents onto the new version
-  only when idle (a restart interrupts turns and replays at most 15 minutes of
-  missed mentions).
-- Tell the owner about every install and every rollback.
-
-(golem's current checker is notify-only; it moves to this policy when the
-generic kit exists.)
+Each such account needs `codex-log-trim` in its crontab before its agent goes
+live (SKILL.md, "The Codex login").
 
 ## What a genius then asks you for
 
-1. Install its `<genius>.env` and `<genius>.md` into the settings directory.
-2. Enable and start `buzz-agent@<genius>` (as its account).
-3. Later: restart it after a change to either file.
+1. Install its `<genius>.env` and `<genius>.md` into `/etc/buzz-agents/`,
+   root-owned, mode 0644.
+2. `buzz-agent-enable <genius> <account>`: it checks the two files, the key,
+   the tag and the Codex login, writes the drop-in, enables and starts the
+   instance, and confirms it stayed up. `--dry-run` shows the drop-in;
+   `--disable <genius>` undoes it.
+3. Later: `systemctl restart buzz-agent@<genius>` after a change to either file.
 
-Record the settings directory, the site prefix and the relay URL in the
-host's own documentation, where the geniuses look.
+Record the settings directory and the relay URL in the host's own
+documentation, where the geniuses look.
