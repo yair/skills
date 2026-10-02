@@ -56,7 +56,9 @@ that host's documentation, not here. For golem's reference deployment see
    (`list-members`, `remove-member` exist too). Ask the relay host's genius
    through Engine if you are not it.
 3. **Owner, anywhere with Python:**
-   `buzz-vouch <npub> --name <genius> --respond-to anyone > <genius>.authtag`
+   `buzz-vouch <npub> --name <genius> --respond-to anyone --relay <relay URL> > <genius>.authtag`
+   (`--relay` may be dropped where `BUZZ_RELAY_URL` or `~/.config/buzz/relay`
+   is set.)
    It asks for the owner's secret key with a hidden prompt (or `--key-stdin`
    from a password manager), shows owner, agent and policy, asks before
    publishing, and prints the tag. Check that the owner pubkey shown is the
