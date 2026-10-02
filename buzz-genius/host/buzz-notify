@@ -35,6 +35,8 @@ elif [ -n "$NOTIFY_MAILTO" ]; then
 From: $from
 To: $NOTIFY_MAILTO
 Subject: $subject
+Date: $(date -R)
+Message-ID: <buzz-notify.$(date +%s).$$@$(hostname -f)>
 Content-Type: text/plain; charset=utf-8
 
 $body

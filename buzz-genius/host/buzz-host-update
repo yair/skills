@@ -26,9 +26,12 @@ build from the same source, and invoked as `buzz` it is the full CLI.
 sprig follows the RELAY, not upstream latest: a harness ahead of the relay is
 what makes NIP-AM publishes fail. With RELAY_REVISION_URL set (the relay host
 publishes its running commit there), sprig is upgraded to the then-current
-sprig-latest whenever that commit changes. Without it, or while it does not
-answer with a commit, sprig follows sprig-latest (the asset is rolling: only
-the newest build can be downloaded at all).
+sprig-latest when that commit changes, and only then. An exact match is not
+obtainable -- sprig-latest is rolling, so only the newest build can be
+downloaded at all -- so the build taken is usually a few commits ahead of the
+relay; the skew is logged and kept in the state file. While a configured URL
+does not answer with a commit, the installed sprig stays. Without
+RELAY_REVISION_URL, sprig follows sprig-latest.
 
 Agents pick up a new adapter or CLI on their next spawn (both are reached
 through the symlinks). A new sprig needs a restart of buzz-agent@*: done
@@ -193,7 +196,25 @@ def sprig_plan(c, state):
             return f"relay still at {rev[:7]}; sprig {have} stays", None, rev
         was = state.get("sprig_relay_revision")
         return f"relay at {rev[:7]} (" + (f"sprig followed {was[:7]}" if was else "first time in step") + ")", "latest", rev
-    return f"relay revision unavailable ({why}); following sprig-latest", "latest", None
+    if c["RELAY_REVISION_URL"] and have:
+        # Configured but not answering: in-step cannot be established, so keep
+        # what is installed rather than drift to latest.
+        return f"relay revision unavailable ({why}); sprig {have} stays until it answers", None, None
+    return f"relay revision {'unavailable' if c['RELAY_REVISION_URL'] else 'not configured'} ({why}); " \
+           + ("first install from sprig-latest" if not have else "following sprig-latest"), "latest", None
+
+
+def skew(relay, sprig):
+    """How far the installed sprig is from the relay, for the record. sprig-latest
+    is rolling (only the newest build can be downloaded), so the build taken when
+    the relay moves is usually a few commits ahead of it; never behind."""
+    if relay == sprig:
+        return f"sprig and relay at the same commit {relay[:7]}"
+    try:
+        d = get(f"https://api.github.com/repos/{REPO}/compare/{relay}...{sprig}")
+        return f"sprig {sprig[:7]} is {d['status']} relay {relay[:7]} (ahead {d['ahead_by']}, behind {d['behind_by']})"
+    except Exception as e:
+        return f"sprig {sprig[:7]} vs relay {relay[:7]}: unknown ({e})"
 
 
 def sprig_install(c):
@@ -417,6 +438,8 @@ def upgrade(comp, c, state):
         state["sprig_commit"] = commit
         if rev:
             state["sprig_relay_revision"] = rev
+            state["sprig_skew"] = skew(rev, commit)
+            log(f"sprig: {state['sprig_skew']}")
     prune(comp, keep, previous)
 
 

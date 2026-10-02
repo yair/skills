@@ -64,10 +64,14 @@ fails:
   upstream latest; a harness ahead of the relay is what makes NIP-AM publishes
   fail. The relay host publishes its running commit as one line at
   `RELAY_REVISION_URL` (e.g. `https://<relay>/.well-known/buzz-relay-revision`);
-  when that changes, the then-current `sprig-latest` is installed, verified
-  against its `.sha256` and every binary against `sprig.json`. Without the
-  URL, or while it does not answer with a commit, sprig follows sprig-latest
-  (the asset is rolling: only the newest build can be downloaded at all).
+  when that changes, and only then, the then-current `sprig-latest` is
+  installed, verified against its `.sha256` and every binary against
+  `sprig.json`. An exact match is not obtainable: the asset is rolling, so
+  only the newest build can be downloaded at all, and it is usually a few
+  commits ahead of the relay (24 on bakkies' first install). The skew is
+  logged and kept in the state file. While a configured URL does not answer
+  with a commit, the installed sprig stays; without the URL, sprig follows
+  sprig-latest.
   Running agents are restarted onto it once idle (no adapter process in the
   service's cgroup), waiting up to `IDLE_WAIT_MINUTES`; a restart interrupts
   turns and replays at most 15 minutes of missed mentions.
