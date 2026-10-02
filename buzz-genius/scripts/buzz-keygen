@@ -9,6 +9,8 @@ is buzz-vouch's (same directory).
 """
 import importlib.machinery, importlib.util, os, re, secrets, sys
 
+sys.dont_write_bytecode = True  # importing buzz-vouch must not leave __pycache__ in the skill
+
 here = os.path.dirname(os.path.realpath(__file__))
 loader = importlib.machinery.SourceFileLoader("buzz_vouch", os.path.join(here, "buzz-vouch"))
 spec = importlib.util.spec_from_loader("buzz_vouch", loader)
