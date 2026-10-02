@@ -7,9 +7,9 @@
 # Codex uses the account's own ~/.codex login), then enable and start it.
 #
 # Why a drop-in: a systemd template cannot derive User= from the instance, and
-# geniuses on one box may live in different accounts. The template itself runs
-# as `nobody`, which has no key, so an instance without this drop-in fails to
-# start instead of running as anyone who matters.
+# geniuses on one box may live in different accounts. The template names an
+# account that does not exist, so an instance without this drop-in fails to
+# start instead of running as anyone at all.
 set -euo pipefail
 dir=/etc/buzz-agents
 

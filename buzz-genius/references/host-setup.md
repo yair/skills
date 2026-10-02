@@ -93,8 +93,8 @@ under `<dir>`, restarts nothing and sends nothing; `BUZZ_HOST_TEST_FAIL=sprig`
 
 Each `buzz-agent@<genius>` runs as the account that owns that genius's home,
 with that account's `HOME`, so its Codex uses that account's existing
-`~/.codex` login (SKILL.md, "The Codex login"). The template runs as
-`nobody`, which holds no key, so an instance fails until
+`~/.codex` login (SKILL.md, "The Codex login"). The template names an
+account that does not exist, so an instance fails until
 `buzz-agent-enable <genius> <account>` has written its drop-in.
 
 Each such account needs `codex-log-trim` in its crontab before its agent goes

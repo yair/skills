@@ -13,7 +13,7 @@ StartLimitBurst=5
 OnFailure=buzz-notify@%n.service
 
 [Service]
-User=nobody
+User=buzz-agent-account-not-set
 Environment=HOME=/nonexistent
 ExecStart=/usr/local/bin/buzz-agent %i
 Restart=on-failure
