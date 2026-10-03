@@ -10,8 +10,8 @@
 # a clean --check after an install is the postcondition.
 #
 # After a first install: edit /etc/buzz-agents/host.conf, then run
-# `buzz-host-update` once by hand (it installs sprig and the adapter); the
-# daily timer keeps them upgraded from then on.
+# `/usr/local/sbin/buzz-host-update` once by hand (it installs sprig and the
+# adapter); the daily timer keeps them upgraded from then on.
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 skill=$(dirname "$here")
@@ -22,7 +22,7 @@ manifest="
 0755|host/buzz-host-update|/usr/local/sbin/buzz-host-update
 0755|host/buzz-agent-enable|/usr/local/sbin/buzz-agent-enable
 0755|host/buzz-notify|/usr/local/sbin/buzz-notify
-0755|host/buzz-agent|/usr/local/bin/buzz-agent
+0755|host/buzz-agent-launch|/usr/local/libexec/buzz-agent-launch
 0755|host/codex-fenced|/usr/local/bin/codex-fenced
 0755|host/buzz-fence-test|/usr/local/bin/buzz-fence-test
 0755|scripts/buzz-as|/usr/local/bin/buzz-as
@@ -37,6 +37,13 @@ manifest="
 0644|host/systemd/codex-log-trim@.timer|/etc/systemd/system/codex-log-trim@.timer
 "
 
+# Before 2026-10-03 the launcher was /usr/local/bin/buzz-agent, which on PATH
+# hid Block's own buzz-agent (the desktop .deb's, in /usr/bin). Recognise the
+# kit's copy by its header; never touch a buzz-agent that is not ours.
+old_launcher=/usr/local/bin/buzz-agent
+kit_old_launcher() { [ -f "$old_launcher" ] && [ ! -L "$old_launcher" ] &&
+  sed -n 2p "$old_launcher" | grep -q '^# buzz-agent <genius> — run one genius as a native agent'; }
+
 if [ "$check" = 1 ]; then
   drift=0
   while IFS='|' read -r mode src dst; do
@@ -48,6 +55,7 @@ if [ "$check" = 1 ]; then
   for d in /etc/buzz-agents; do
     [ "$(stat -c '%a %U' "$d" 2>/dev/null)" = "755 root" ] && echo "ok      $d/" || { echo "MISSING $d/ (0755 root)"; drift=1; }
   done
+  if kit_old_launcher; then echo "STALE   $old_launcher (the kit's launcher under its old name; rerun install)"; drift=1; fi
   [ -f /etc/buzz-agents/host.conf ] && echo "ok      /etc/buzz-agents/host.conf" || { echo "MISSING /etc/buzz-agents/host.conf"; drift=1; }
   systemctl is-enabled --quiet buzz-host-update.timer && echo "ok      buzz-host-update.timer enabled" || { echo "OFF     buzz-host-update.timer"; drift=1; }
   exit "$drift"
@@ -72,6 +80,7 @@ while IFS='|' read -r mode src dst; do
 done <<<"$manifest"
 
 # --- stage beside each destination, then rename into place ---
+install -d -m 0755 -o root -g root /usr/local/libexec
 while IFS='|' read -r mode src dst; do
   [ -n "$src" ] || continue
   install -m "$mode" -o root -g root "$skill/$src" "$(dirname "$dst")/.$(basename "$dst").new"
@@ -79,6 +88,7 @@ while IFS='|' read -r mode src dst; do
 done <<<"$manifest"
 
 install -d -m 0755 -o root -g root /etc/buzz-agents /usr/local/lib/buzz
+if kit_old_launcher; then rm -f "$old_launcher"; echo "removed the kit's old launcher $old_launcher (now /usr/local/libexec/buzz-agent-launch)"; fi
 if [ ! -f /etc/buzz-agents/host.conf ]; then
   install -m 0644 -o root -g root "$here/host.conf.example" /etc/buzz-agents/host.conf
   echo "wrote /etc/buzz-agents/host.conf from the example: edit it (relay, notifications)"
@@ -89,4 +99,4 @@ systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/buzz-host-update.service /etc/systemd/system/buzz-host-update.timer || true
 systemctl enable --now buzz-host-update.timer
 echo "installed the buzz-genius host kit from $skill ($(git -C "$skill" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
-echo "next: review /etc/buzz-agents/host.conf, then: buzz-host-update"
+echo "next: review /etc/buzz-agents/host.conf, then: sudo /usr/local/sbin/buzz-host-update"

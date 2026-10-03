@@ -23,8 +23,12 @@ bakkies, a Debian 12 box; bakkies-docker `plans/025` lists every change.
 
     sudo <skill>/host/buzz-host-install          # the kit's own files
     sudoedit /etc/buzz-agents/host.conf          # relay revision URL, notifications
-    sudo buzz-host-update                        # sprig and the adapter, first time
+    sudo /usr/local/sbin/buzz-host-update        # sprig and the adapter, first time
     sudo <skill>/host/buzz-host-install --check  # postcondition: every line ok
+
+Give root's tools by full path under `sudo`: Debian's `secure_path` may leave
+out `/usr/local` (on sid it is `/usr/sbin:/usr/bin:/sbin:/bin`), and then
+`sudo buzz-host-update` is "command not found".
 
 Run `buzz-host-install` again after pulling a new version of the skill.
 
@@ -36,7 +40,7 @@ What lands where:
 | `/usr/local/lib/buzz/codex-acp/<version>/` | `@agentclientprotocol/codex-acp` with its lockfile and `node_modules` |
 | `/usr/local/lib/buzz/<component>/current` | the active version, switched by rename |
 | `/usr/local/bin/buzz`, `buzz-acp`, `codex-acp` | links through `current` |
-| `/usr/local/bin/buzz-agent` | the launcher `buzz-agent@.service` runs; sets `CODEX_PATH` to the wrapper below |
+| `/usr/local/libexec/buzz-agent-launch` | the launcher `buzz-agent@.service` runs; sets `CODEX_PATH` to the wrapper below. Off `PATH` on purpose: as `/usr/local/bin/buzz-agent` (its name before 2026-10-03, removed by `buzz-host-install`) it hid Block's own `buzz-agent` from the desktop `.deb` |
 | `/usr/local/bin/codex-fenced` | **the fence**: the Codex the adapter runs, approvals forced off and escalations refused (`native-agent.md`, "The fence") |
 | `/usr/local/bin/buzz-fence-test` | proves the fence through the adapter, as an agent's account |
 | `/usr/local/bin/buzz-as`, `buzz-keygen`, `buzz-vouch`, `codex-log-trim` | this skill's scripts, for the geniuses |
@@ -111,9 +115,9 @@ no root help, a line in its own crontab does the same.
 
 1. Install its `<genius>.env` and `<genius>.md` into `/etc/buzz-agents/`,
    root-owned, mode 0644.
-2. `buzz-agent-enable <genius> <account>`: it checks the two files, the key,
-   the tag and the Codex login, writes the drop-in, enables and starts the
-   instance, and confirms it stayed up. `--dry-run` shows the drop-in;
+2. `sudo /usr/local/sbin/buzz-agent-enable <genius> <account>`: it checks the
+   two files, the key, the tag and the Codex login, writes the drop-in,
+   enables and starts the instance, and confirms it stayed up. `--dry-run` shows the drop-in;
    `--disable <genius>` undoes it.
 3. Later: `systemctl restart buzz-agent@<genius>` after a change to either file.
 

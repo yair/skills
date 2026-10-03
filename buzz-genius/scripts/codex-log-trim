@@ -11,12 +11,20 @@
 # large file slows every turn until turns time out.
 #
 # Live-safe by default: (re)install a trigger that drops sub-WARN rows at
-# insert (the community fix from #17320), then DELETE the ones already there.
-# Both are fine beside a running Codex (WAL). Freed pages are reused, so the
-# file stops growing; it does not shrink. --vacuum also rewrites the file to
-# reclaim the space, which contends with a live writer: stop the account's
-# Codex users first (e.g. buzz-agent@<genius>). Session state (state_*.sqlite)
-# is never touched.
+# insert (the community fix from #17320), DELETE the ones already there, then
+# checkpoint the write-ahead log with TRUNCATE. All fine beside a running
+# Codex. The checkpoint matters: the database is in WAL mode and an account
+# usually has some Codex running (an app-server daemon stays up between
+# sessions), so the plain auto-checkpoints never shrink the WAL, which stays at
+# its high-water mark (33 MB seen on zhizi). Freed pages in the database are
+# reused, so it stops growing but does not shrink. --vacuum also rewrites the
+# database to reclaim them. With the trigger in place it is small and the
+# rewrite is brief. On a database that grew large before the trim, stop the
+# account's Codex users first (e.g. buzz-agent@<genius>), since a long VACUUM
+# holds off their writes. Sizes are reported as database plus WAL. A
+# checkpoint that cannot finish because a reader holds an old snapshot is
+# reported as busy, not as a failure; the next run retries. Session state
+# (state_*.sqlite) is never touched.
 #
 # Adapted from the oc account's codex-log-tamer.sh on bakkies.
 set -uo pipefail
@@ -26,7 +34,8 @@ in_list=$(printf "'%s'," ${keep//,/ }); in_list=${in_list%,}
 command -v sqlite3 >/dev/null || { echo "codex-log-trim: sqlite3 is not installed" >&2; exit 1; }
 [ -f "$db" ] || { echo "[$(date -Iseconds)] no $db yet"; exit 0; }
 
-before=$(stat -c %s "$db")
+size() { local t=0 f; for f in "$db" "$db-wal"; do [ -f "$f" ] && t=$((t + $(stat -c %s "$f"))); done; echo "$t"; }
+before=$(size)
 sqlite3 -cmd ".timeout 5000" "$db" "CREATE TRIGGER IF NOT EXISTS trim_low_level_logs
     BEFORE INSERT ON logs WHEN NEW.level NOT IN ($in_list)
     BEGIN SELECT RAISE(IGNORE); END;" || { echo "codex-log-trim: trigger failed on $db" >&2; exit 1; }
@@ -36,6 +45,10 @@ vac=skip
 if [ "${1:-}" = --vacuum ]; then
   sqlite3 -cmd ".timeout 10000" "$db" "VACUUM;" && vac=ok || { vac=FAIL; }
 fi
-after=$(stat -c %s "$db")
-echo "[$(date -Iseconds)] $db: pruned=${rows:-?} vacuum=$vac $((before/1024))K -> $((after/1024))K (keep $keep)"
-[ "$vac" != FAIL ]
+# busy|log-frames|checkpointed-frames; busy=1 means a reader kept it from
+# finishing (it retries next run)
+ckpt=$(sqlite3 -cmd ".timeout 5000" "$db" "PRAGMA wal_checkpoint(TRUNCATE);" | tail -1)
+case "$ckpt" in 0\|*) ckpt=ok ;; 1\|*) ckpt=busy ;; *) ckpt="FAIL(${ckpt:-no answer})" ;; esac
+after=$(size)
+echo "[$(date -Iseconds)] $db: pruned=${rows:-?} vacuum=$vac checkpoint=$ckpt $((before/1024))K -> $((after/1024))K db+wal (keep $keep)"
+[ "$vac" != FAIL ] && [ "${ckpt#FAIL}" = "$ckpt" ]

@@ -15,7 +15,7 @@ OnFailure=buzz-notify@%n.service
 [Service]
 User=buzz-agent-account-not-set
 Environment=HOME=/nonexistent
-ExecStart=/usr/local/bin/buzz-agent %i
+ExecStart=/usr/local/libexec/buzz-agent-launch %i
 Restart=on-failure
 RestartSec=20
 # SIGTERM lets sprig drain in-flight turns and publish "offline"; then the

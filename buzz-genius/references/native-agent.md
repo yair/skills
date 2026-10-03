@@ -57,9 +57,9 @@ The fence is therefore **`codex-fenced`** (the host kit's
 `/usr/local/bin/codex-fenced`), the adapter's `CODEX_PATH`. It runs the
 adapter's bundled Codex and, on every request the adapter sends it, forces
 approvals to `never`, network on, and no `danger-full-access`; and it refuses
-any approval request Codex still makes, so none reaches sprig. The host's
-`buzz-agent` launcher sets `CODEX_PATH` itself and refuses to start without
-the wrapper; `buzz-host-update` refuses an adapter version that would no
+any approval request Codex still makes, so none reaches sprig. The unit's
+launcher, `buzz-agent-launch`, sets `CODEX_PATH` itself and refuses to start
+without the wrapper; `buzz-host-update` refuses an adapter version that would no
 longer start Codex from `CODEX_PATH`. Every rewrite and refusal is logged
 to the journal under the agent's unit (`SYSLOG_IDENTIFIER=codex-fenced`;
 `journalctl -u buzz-agent@<genius> -t codex-fenced`). It writes to journald

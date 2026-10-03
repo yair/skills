@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# buzz-agent <genius> — run one genius as a native agent on the host's Buzz
-# relay, under sprig's headless harness. Started by buzz-agent@<genius>, as
+# buzz-agent-launch <genius> — run one genius as a native agent on the host's
+# Buzz relay, under sprig's headless harness. Started by buzz-agent@<genius>, as
 # the account that owns the genius's home (buzz-agent-enable sets it).
+#
+# Installed off PATH, in /usr/local/libexec: only the unit runs it, and as
+# /usr/local/bin/buzz-agent (its old name) it hid Block's own `buzz-agent`,
+# which the Buzz desktop .deb ships in /usr/bin.
 #
 # Settings and instructions are root-owned, so the agent cannot rewrite its
 # own rules; this refuses to start if they are not:
@@ -16,20 +20,20 @@
 # Adapted from golem's scripts/buzz-agent (github.com/yair/golem, plan 0048).
 set -euo pipefail
 name=${1:-}
-case "$name" in ''|*[!a-z0-9-]*) echo "usage: buzz-agent <genius>  (lowercase letters, digits, -)" >&2; exit 64;; esac
-[ "$(id -u)" -ne 0 ] || { echo "buzz-agent: refusing to run an agent as root" >&2; exit 77; }
+case "$name" in ''|*[!a-z0-9-]*) echo "usage: buzz-agent-launch <genius>  (lowercase letters, digits, -)" >&2; exit 64;; esac
+[ "$(id -u)" -ne 0 ] || { echo "buzz-agent-launch: refusing to run an agent as root" >&2; exit 77; }
 dir=/etc/buzz-agents
 conf=$dir/$name.env
 instructions=$dir/$name.md
 key=$HOME/.config/buzz/$name.key
 tag=$HOME/.config/buzz/$name.authtag
 for f in "$conf" "$instructions" "$key" "$tag"; do
-  [ -r "$f" ] || { echo "buzz-agent: cannot read $f" >&2; exit 78; }
+  [ -r "$f" ] || { echo "buzz-agent-launch: cannot read $f" >&2; exit 78; }
 done
 for f in "$dir" "$conf" "$instructions"; do
   # root-owned and writable by root alone, or the agent could edit its rules
   [ "$(stat -c '%u' "$f")" = 0 ] && [ -z "$(find "$f" -maxdepth 0 -perm /022)" ] ||
-    { echo "buzz-agent: $f must be root-owned and not group/world-writable" >&2; exit 78; }
+    { echo "buzz-agent-launch: $f must be root-owned and not group/world-writable" >&2; exit 78; }
 done
 
 set -a
@@ -40,7 +44,7 @@ set +a
 # codex-fenced, whatever the settings say (sprig auto-approves everything the
 # agent asks, and the adapter's own modes ask; see codex-fenced).
 export CODEX_PATH=/usr/local/bin/codex-fenced
-[ -x "$CODEX_PATH" ] || { echo "buzz-agent: $CODEX_PATH is missing; refusing to run unfenced" >&2; exit 78; }
+[ -x "$CODEX_PATH" ] || { echo "buzz-agent-launch: $CODEX_PATH is missing; refusing to run unfenced" >&2; exit 78; }
 BUZZ_PRIVATE_KEY=$(cat "$key")
 BUZZ_AUTH_TAG=$(cat "$tag")
 export BUZZ_PRIVATE_KEY BUZZ_AUTH_TAG

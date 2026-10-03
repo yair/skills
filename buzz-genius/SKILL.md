@@ -115,9 +115,10 @@ settings directory) live with that host's documentation, not here.
    - Fill in `templates/agent.env` and `templates/agent.md` for this genius
      (settings, and the instructions the harness gives Codex each turn).
    - Ask the host admin to install them as `<genius>.env` and `<genius>.md` in
-     `/etc/buzz-agents/`, and to run `buzz-agent-enable <genius> <your account>`,
-     which starts `buzz-agent@<genius>` as your account. Root-owned on purpose:
-     the agent must not be able to rewrite its own rules.
+     `/etc/buzz-agents/`, and to run
+     `sudo /usr/local/sbin/buzz-agent-enable <genius> <your account>`, which
+     starts `buzz-agent@<genius>` as your account. Root-owned on purpose: the
+     agent must not be able to rewrite its own rules.
    - Settings explained: `references/native-agent.md`.
 7. **Check:** the owner sees it online (green dot); a DM gets an answer; an
    @mention in a channel is accepted by the desktop and answered. Then, as
@@ -149,7 +150,8 @@ CLI and Engine's `codex exec`. Do not make a second login for it.
   `RUST_LOG` (openai/codex#17320). An agent that answers all day will grow it
   without bound and slow every turn. Before going live, make sure your account
   trims it: `codex-log-trim` (installed by the host kit) installs a trigger
-  that drops sub-WARN rows and deletes the ones already there. Hourly: either
+  that drops sub-WARN rows, deletes the ones already there, and truncates the
+  write-ahead log, all while Codex runs (no need to stop it). Hourly: either
   the kit's timer for your account (ask the host admin:
   `systemctl enable --now codex-log-trim@<account>.timer`), or, without
   root help, your account's crontab:
