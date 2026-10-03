@@ -1,0 +1,14 @@
+[Unit]
+# Keep an account's Codex log database from growing without bound: the
+# buzz-genius kit's codex-log-trim, run as that account (systemd sets its HOME,
+# so it trims that account's ~/.codex). Codex writes a row per streamed chunk
+# into logs_2.sqlite and ignores RUST_LOG (openai/codex#17320), and a native
+# Buzz agent streams all day. Enable per account with the timer of the same name:
+#   systemctl enable --now codex-log-trim@<account>.timer
+Description=Trim %i's Codex log database
+OnFailure=buzz-notify@%n.service
+
+[Service]
+Type=oneshot
+User=%i
+ExecStart=/usr/local/bin/codex-log-trim

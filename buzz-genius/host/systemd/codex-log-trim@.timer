@@ -1,0 +1,11 @@
+[Unit]
+# Hourly codex-log-trim for one account: systemctl enable --now codex-log-trim@<account>.timer
+# (for hosts that schedule with systemd rather than an account crontab).
+Description=Hourly trim of %i's Codex log database
+
+[Timer]
+OnCalendar=*-*-* *:17:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

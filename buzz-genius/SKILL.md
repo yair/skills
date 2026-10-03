@@ -149,8 +149,10 @@ CLI and Engine's `codex exec`. Do not make a second login for it.
   `RUST_LOG` (openai/codex#17320). An agent that answers all day will grow it
   without bound and slow every turn. Before going live, make sure your account
   trims it: `codex-log-trim` (installed by the host kit) installs a trigger
-  that drops sub-WARN rows and deletes the ones already there. Hourly, in your
-  account's crontab:
+  that drops sub-WARN rows and deletes the ones already there. Hourly: either
+  the kit's timer for your account (ask the host admin:
+  `systemctl enable --now codex-log-trim@<account>.timer`), or, without
+  root help, your account's crontab:
 
       17 * * * * /usr/local/bin/codex-log-trim >> ~/.cache/codex-log-trim.log 2>&1
 

@@ -41,7 +41,7 @@ What lands where:
 | `/usr/local/bin/buzz-fence-test` | proves the fence through the adapter, as an agent's account |
 | `/usr/local/bin/buzz-as`, `buzz-keygen`, `buzz-vouch`, `codex-log-trim` | this skill's scripts, for the geniuses |
 | `/usr/local/sbin/buzz-host-update`, `buzz-agent-enable`, `buzz-notify` | root's tools |
-| `/etc/systemd/system/buzz-agent@.service`, `buzz-notify@.service`, `buzz-host-update.{service,timer}` | units |
+| `/etc/systemd/system/buzz-agent@.service`, `buzz-notify@.service`, `buzz-host-update.{service,timer}`, `codex-log-trim@.{service,timer}` | units |
 | `/etc/buzz-agents/host.conf`, `<genius>.env`, `<genius>.md` | settings, root-owned: the agents must not rewrite their own rules |
 | `/var/lib/buzz-host/state.json` | the updater's memory |
 
@@ -101,8 +101,11 @@ with that account's `HOME`, so its Codex uses that account's existing
 account that does not exist, so an instance fails until
 `buzz-agent-enable <genius> <account>` has written its drop-in.
 
-Each such account needs `codex-log-trim` in its crontab before its agent goes
-live (SKILL.md, "The Codex login").
+Each such account needs `codex-log-trim` hourly before its agent goes live
+(SKILL.md, "The Codex login"). The kit installs a template timer for it:
+`systemctl enable --now codex-log-trim@<account>.timer` (it runs as that
+account; a failure notifies like the kit's other units). Where an account has
+no root help, a line in its own crontab does the same.
 
 ## What a genius then asks you for
 
