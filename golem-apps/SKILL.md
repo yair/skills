@@ -33,8 +33,9 @@ What you don't get, by design:
   commands listed below, and only for apps you maintain.
 - **No reach into the tailnet.** Your app can reach the public internet and
   nothing private (not golem's other services, not other apps, not the LAN).
-  A short, closed list of services can be granted per app by golem's admin;
-  today that list is empty.
+  The narrow exceptions are explicit and per app: **its own database** if it
+  has one (section 6), and anything on a short, closed list of services
+  golem's admin can grant (empty today).
 - **Not public.** Only tailnet devices reach it. Publishing to the internet is
   a different, future procedure through bakkies.
 - **No shared data between apps.** Each app has its own `/data` and, if it
@@ -53,6 +54,7 @@ pushes with its own key.
 
        git clone https://github.com/yair/golem-app-fixture myapp && cd myapp
        rm -rf .git && git init -b main && git add -A && git commit -m "start from golem-app-fixture"
+       gh auth login                                 # once, as the human, if gh isn't logged in yet
        gh auth refresh -h github.com -s workflow     # once; needed to push the workflow file
        gh repo create OWNER/myapp --public --source . --push
 
@@ -82,12 +84,14 @@ changes to the workflow itself go through the human (see below).
   health, and only then publishes it to `ghcr.io/<owner>/<repo>`, tagged with
   the commit SHA. A red run publishes nothing.
 
-**Pushing the workflow file needs a GitHub login with the `workflow`
-scope.** Deploy keys and most bot tokens are refused ("refusing to allow ... to
-create or update workflow"). If that happens, ask a human with that scope to
+**Pushing the workflow file needs a GitHub login allowed to change
+workflows:** a classic token or `gh` login with the `workflow` scope, or a
+fine-grained token with "Workflows: write". SSH deploy keys and tokens without
+it are refused ("refusing to allow ... to create or update workflow"). If that happens, ask a human with that scope to
 add the file once; later pushes of other files work normally. One way, with
 the GitHub CLI:
 
+    gh auth login                               # if not logged in yet
     gh auth refresh -h github.com -s workflow
     gh api -X PUT repos/OWNER/REPO/contents/.github/workflows/golem-image.yml \
       -f message="golem image workflow" -f content="$(base64 -w0 golem-image.yml)"
@@ -99,11 +103,14 @@ After the workflow is green, from your own machine:
     golem-apps/scripts/ghcr-check OWNER/REPO <commit-sha>     # from a skills checkout
 
 It prints `OK` and the image digest, or says exactly what is wrong: no such
-tag (the workflow didn't publish it), or the package is **private**. New
-packages from public repositories are usually public. If yours is private,
-either make it public (GitHub > your package > Package settings > Change
-visibility) or arrange a read-only token for golem (section 5). Quote the
-digest in your request.
+tag (the workflow didn't publish it), or the package is **private**. Packages
+published from a public repository have come out public so far, but don't
+assume: `ghcr-check` tells you. If yours is private, either make it public
+(`https://github.com/users/OWNER/packages/container/REPO/settings`, "Change
+visibility"; for an organization, `orgs/` instead of `users/`) or ask golem's
+admin to install a **read-only registry token** for your app. That is an
+admin handoff, arranged with golem's admin: `secret-set` does **not** affect
+image pulls. Quote the digest in your request.
 
 On Windows, run it from Git Bash; `curl.exe` comes with Windows 10 and later.
 
@@ -249,9 +256,11 @@ Ask for it with the app, or later; golem's admin arranges it.
 
 **Practise a failed release first** (with the fixture, or any app that
 supports it). The fixture fails its health check on purpose when the secret
-`FIXTURE_FAIL_HEALTH_VERSION` equals its commit SHA:
+`FIXTURE_FAIL_HEALTH_VERSION` equals its commit SHA. You need a **second,
+published** release, different from the one running now: if you marked the
+running release, the restored release would fail too.
 
-    git rev-parse HEAD > fail.txt          # the release you're about to deploy
+    echo <sha of a published release that is NOT running now> > fail.txt
     ssh golem-apps secret-set testapp FIXTURE_FAIL_HEALTH_VERSION < fail.txt
     ssh golem-apps deploy testapp $(cat fail.txt)    # fails; previous release is restored
     ssh golem-apps releases testapp                  # shows the failed attempt
@@ -260,9 +269,12 @@ supports it). The fixture fails its health check on purpose when the secret
     ssh golem-apps rollback testapp                  # and back again
 
 
-- **Deploy says the health check failed:** nothing changed for your users;
-  the old release is back. Read the log lines it printed, fix, push, deploy
-  the new SHA.
+- **Deploy says the health check failed:** the previous release is back and
+  healthy. Read the log lines it printed, fix, push, deploy the new SHA.
+- **Deploys are not zero-downtime.** golem replaces the container in place, so
+  expect a few seconds of 502 during any deploy, restart or rollback. A
+  failed deploy can mean up to about a minute of errors (the health-check
+  window) before the previous release is back. Deploy when that is acceptable.
 - **`cannot pull`:** run `ghcr-check`. Usually the tag doesn't exist yet
   (workflow still running or red) or the package is private.
 - **The app is up but behaves badly:** `logs`, then `rollback` if a recent
