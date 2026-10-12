@@ -180,14 +180,15 @@ Ask for it with the app, or later; golem's admin arranges it.
   tables, indexes and views, and read or fix data. It has no rights anywhere
   else. Tables the owner creates in the `public` schema are automatically
   readable and writable by the app.
-- **Statements stop at the first error** (`ON_ERROR_STOP`): nothing after the
-  failing statement runs. Wrap a multi-step change in `begin; ... commit;` so
-  it applies all or nothing.
+- **Everything you send in one `db-sql` runs as one transaction:** if any
+  statement fails, none of it is applied. Send plain SQL only; psql's
+  backslash commands (`\d`, `\i`, `\copy` ...) are not available. To list
+  tables, query `information_schema.tables`.
 
 | Command | Does |
 |---|---|
 | `db-check <app>` | connects exactly as the app does and prints the role and database |
-| `db-sql <app>` | runs SQL from standard input as the owner (up to 1 MB in and out, 15 minutes) |
+| `db-sql <app>` | runs SQL from standard input as the owner, as one transaction (up to 100 KB in, 1 MB out, 15 minutes); split bigger loads |
 | `db-dump <app>` | prints a plain-SQL dump of the whole database: save one before a risky change |
 
 **Order for a change that touches the schema:**
