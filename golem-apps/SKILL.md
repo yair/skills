@@ -4,7 +4,7 @@ description: >
   Host a small web app on golem, the fleet's home server, at its own
   https://<app>.albanialink.com on the tailnet, and maintain it yourself:
   deploy a GitHub-built image, check status and logs, restart, roll back and
-  set secrets. For OpenClaw assistants, Engine geniuses and humans alike. Use
+  set secrets, and give it its own PostgreSQL database. For OpenClaw assistants, Engine geniuses and humans alike. Use
   when asked to "host", "deploy", "put online" or "keep running" an app or
   website for the family's devices, when an app should stop depending on a
   laptop being awake, when a hosted app is down or misbehaving, or when an app
@@ -33,8 +33,8 @@ What you don't get, by design:
   today that list is empty.
 - **Not public.** Only tailnet devices reach it. Publishing to the internet is
   a different, future procedure through bakkies.
-- **No shared data between apps.** Each app has its own `/data` and (later)
-  its own database. To use another app's data, call that app's API.
+- **No shared data between apps.** Each app has its own `/data` and, if it
+  asks, its own database. To use another app's data, call that app's API.
 
 ## 1. What your repository must contain
 
@@ -109,6 +109,7 @@ Engine task for genius `golem-admin` if you're a genius. Give:
 | persistent `/data`? | yes | survives deploys and restarts |
 | memory | 128m | up to 1g |
 | maintainers | `david`, `zeresh` | each needs a key (section 3) |
+| database? | yes | its own PostgreSQL database (section 6) |
 | digest | from `ghcr-check` | proves the image exists |
 
 golem's admin registers the app and requests its name from bakkies. The
@@ -137,6 +138,7 @@ The first time, check golem's host key: ED25519
 | `secret-set <app> <NAME>` | stores a secret, **value on standard input** |
 | `secret-list <app>` | secret names only, never values |
 | `secret-unset <app> <NAME>` | removes one |
+| `db-check`, `db-sql`, `db-dump` | the app's database (section 6) |
 
 Deploy by commit SHA (what the workflow tags), not `latest`, so `releases`
 tells you exactly what ran. golem keeps the last five healthy releases.
@@ -149,7 +151,8 @@ transcript or chat can see them:**
 
     ssh -i ~/.ssh/golem-apps golem-apps@golem.tn.albanialink.com secret-set smokelog API_KEY < api-key.txt
 
-Names look like `API_KEY` (capitals, digits, `_`). `PORT` is reserved. Values
+Names look like `API_KEY` (capitals, digits, `_`). `PORT` and
+`DATABASE_URL` are reserved: golem sets them. Values
 are one line, up to 4 KB. A secret you generate yourself never needs a human:
 `openssl rand -hex 32 > session-secret.txt`.
 
@@ -157,7 +160,47 @@ If someone else holds the secret (say, Assaf's password for a service), they
 give it to you the way they normally share things with you, you put it in a
 file, and you run `secret-set`. Don't put it in Buzz, Engine, GitHub or chat.
 
-## 6. When things go wrong
+## 6. A database
+
+An app can have its own PostgreSQL database (on bakkies, backed up nightly).
+Ask for it with the app, or later; golem's admin arranges it.
+
+- **Your app gets it as `DATABASE_URL`**
+  (`postgresql://user:password@host:port/database?sslmode=disable`). Most
+  libraries take that string directly. You never see or handle the password.
+  golem rotates it when needed.
+- **The app's own role reads and writes data but cannot change the schema**
+  (no creating, altering or dropping tables). So schema changes are not done
+  by the app at start-up. **You** make them, as the database's owner, through
+  golem:
+
+      ssh ... golem-apps@golem.tn.albanialink.com db-sql smokelog < migrations/0003-add-mood.sql
+
+  Inside its own database the owner can do anything: create, alter and drop
+  tables, indexes and views, and read or fix data. It has no rights anywhere
+  else. Tables the owner creates in the `public` schema are automatically
+  readable and writable by the app.
+- **Statements stop at the first error** (`ON_ERROR_STOP`): nothing after the
+  failing statement runs. Wrap a multi-step change in `begin; ... commit;` so
+  it applies all or nothing.
+
+| Command | Does |
+|---|---|
+| `db-check <app>` | connects exactly as the app does and prints the role and database |
+| `db-sql <app>` | runs SQL from standard input as the owner (up to 1 MB in and out, 15 minutes) |
+| `db-dump <app>` | prints a plain-SQL dump of the whole database: save one before a risky change |
+
+**Order for a change that touches the schema:**
+1. `db-dump` to a file, as your undo.
+2. A **backwards-compatible** `db-sql` migration: add, don't rename or drop
+   yet. The release that is running now must keep working with it.
+3. `deploy` the new release.
+4. Clean up (drop old columns) in a later migration, once you won't roll
+   back past it.
+
+`rollback` restores code, never the schema or data; your dump does.
+
+## 7. When things go wrong
 
 - **Deploy says the health check failed:** nothing changed for your users;
   the old release is back. Read the log lines it printed, fix, push, deploy
@@ -166,9 +209,12 @@ file, and you run `secret-set`. Don't put it in Buzz, Engine, GitHub or chat.
   (workflow still running or red) or the package is private.
 - **The app is up but behaves badly:** `logs`, then `rollback` if a recent
   deploy caused it.
-- **What rollback does not undo:** anything your app wrote to `/data` (or,
-  later, to its database). If a release changes stored data, make the change
-  backwards-compatible, or back the data up through the app first.
+- **What rollback does not undo:** anything your app wrote to `/data` or its
+  database, and any schema change. Make changes backwards-compatible, and take
+  a `db-dump` first (section 6).
+- **`db-check` fails:** the database may not be provisioned yet, or the app has
+  never been deployed (its network carries the database path). Deploy once,
+  then retry. If it still fails, ask golem's admin.
 - **"you do not maintain an app called ..."**: wrong app name, or you aren't
   listed as its maintainer. Ask golem's admin.
 - **"another operation on this app is running"**: wait and retry; one
