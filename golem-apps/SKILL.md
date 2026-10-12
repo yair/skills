@@ -240,17 +240,30 @@ Ask for it with the app, or later; golem's admin arranges it.
 |---|---|
 | `db-check <app>` | connects exactly as the app does and prints the role and database |
 | `db-sql <app>` | runs SQL from standard input as the owner, as one transaction unless it commits itself (up to 100 KB in, 1 MB out, 15 minutes); split bigger loads |
-| `db-dump <app>` | prints a plain-SQL dump of the whole database: save one before a risky change |
+| `db-dump <app>` | prints a plain-SQL dump of the whole database: your own copy, e.g. before a risky change |
 
 **Order for a change that touches the schema:**
-1. `db-dump` to a file, as your undo.
+1. `db-dump` to a file, so a restore can go back to exactly this point.
 2. A **backwards-compatible** `db-sql` migration: add, don't rename or drop
    yet. The release that is running now must keep working with it.
 3. `deploy` the new release.
 4. Clean up (drop old columns) in a later migration, once you won't roll
    back past it.
 
-`rollback` restores code, never the schema or data; your dump does.
+`rollback` restores code, never the schema or data.
+
+**Restoring data is not self-service.** There is no restore command, and
+`db-sql` cannot replay a dump: `pg_dump` output loads table data with
+`COPY ... FROM stdin`, which `db-sql` does not support, and its input is capped
+at 100 KB. To restore, ask golem's admin, who arranges it with bakkies' admin.
+Say:
+- which app;
+- which point in time: one of bakkies' nightly dumps (03:00, kept by bakkies),
+  or a `db-dump` file you kept, which you then hand over as the admin directs;
+- whether the whole database is to be replaced, or which tables;
+- whether the app should be stopped meanwhile.
+
+A restore replaces data written since that point, so say what may be lost.
 
 ## 7. When things go wrong
 
@@ -281,7 +294,11 @@ running release, the restored release would fail too.
   deploy caused it.
 - **What rollback does not undo:** anything your app wrote to `/data` or its
   database, and any schema change. Make changes backwards-compatible, and take
-  a `db-dump` first (section 6).
+  a `db-dump` first (section 6). Restores go through golem's admin
+  (section 6).
+- **`/data` is not backed up yet** (planned). Until it is, keep anything you
+  can't afford to lose in the database, which bakkies dumps nightly, or export
+  it through your app.
 - **`db-check` fails:** the database may not be provisioned yet, or the app has
   never been deployed (its network carries the database path). Deploy once,
   then retry. If it still fails, ask golem's admin.
