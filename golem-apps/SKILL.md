@@ -13,6 +13,10 @@ description: >
 
 # golem-apps: your app on golem, maintained by you
 
+Paths in this skill like `scripts/ghcr-check` and `assets/golem-image.yml`
+are inside this skill's folder: from the root of a skills checkout, that's
+`golem-apps/scripts/ghcr-check`.
+
 ## What you get, and what you don't
 
 golem runs your app as one container, built by **your** GitHub repository's
@@ -40,6 +44,26 @@ What you don't get, by design:
 
 Copy `golem-app-fixture` (github.com/yair/golem-app-fixture): it is the
 smallest app that works, and every rule below is visible in it.
+
+**Getting a repository.** GitHub accounts belong to humans. An OpenClaw
+assistant asks its human to make the repository once; afterwards the assistant
+pushes with its own key.
+
+1. **The human**, starting from a copy of the fixture (or your own code):
+
+       git clone https://github.com/yair/golem-app-fixture myapp && cd myapp
+       rm -rf .git && git init -b main && git add -A && git commit -m "start from golem-app-fixture"
+       gh auth refresh -h github.com -s workflow     # once; needed to push the workflow file
+       gh repo create OWNER/myapp --public --source . --push
+
+   Then they let the assistant push. Either they attach the assistant's key
+   with write access, through the `repo-keys` skill or GitHub > repository >
+   Settings > Deploy keys > "Allow write access", or they push for it.
+2. **The assistant** clones `git@github.com:OWNER/myapp.git` with that key,
+   changes the code, and pushes to `main`. Every push runs the workflow.
+
+A deploy key can push anything **except** files under `.github/workflows/`;
+changes to the workflow itself go through the human (see below).
 
 - A `Dockerfile` at the root. The image must run as **any non-root user id
   golem gives it**: no `USER root`, no `chown` or `apt` at start-up.
@@ -72,7 +96,7 @@ the GitHub CLI:
 
 After the workflow is green, from your own machine:
 
-    scripts/ghcr-check OWNER/REPO <commit-sha>
+    golem-apps/scripts/ghcr-check OWNER/REPO <commit-sha>     # from a skills checkout
 
 It prints `OK` and the image digest, or says exactly what is wrong: no such
 tag (the workflow didn't publish it), or the package is **private**. New
@@ -123,8 +147,25 @@ Every command has the same shape. Use your key and golem's tailnet name:
 
     ssh -i ~/.ssh/golem-apps golem-apps@golem.tn.albanialink.com <command>
 
-The first time, check golem's host key: ED25519
-`SHA256:nOFBuRFkoaPBzoN3kzyOQUNicGsOAFjtw30KNF6AFQo`.
+**First login.** Wait until golem's admin confirms your key is installed.
+Then check golem's host key before trusting it:
+
+    ssh-keyscan -t ed25519 golem.tn.albanialink.com 2>/dev/null | ssh-keygen -lf -
+
+It must print `SHA256:nOFBuRFkoaPBzoN3kzyOQUNicGsOAFjtw30KNF6AFQo`. If it
+doesn't, stop and tell golem's admin. If it matches, connect once with
+`-o StrictHostKeyChecking=accept-new` and run `apps`; you should see your
+app(s). From then on, an entry in `~/.ssh/config` saves typing:
+
+    Host golem-apps
+        HostName golem.tn.albanialink.com
+        User golem-apps
+        IdentityFile ~/.ssh/golem-apps
+        IdentitiesOnly yes
+
+after which every command is `ssh golem-apps <command>`, e.g.
+`ssh golem-apps status testapp`. A command you are not allowed to run fails
+with a one-line reason. You never get a shell.
 
 | Command | Does |
 |---|---|
@@ -205,6 +246,19 @@ Ask for it with the app, or later; golem's admin arranges it.
 `rollback` restores code, never the schema or data; your dump does.
 
 ## 7. When things go wrong
+
+**Practise a failed release first** (with the fixture, or any app that
+supports it). The fixture fails its health check on purpose when the secret
+`FIXTURE_FAIL_HEALTH_VERSION` equals its commit SHA:
+
+    git rev-parse HEAD > fail.txt          # the release you're about to deploy
+    ssh golem-apps secret-set testapp FIXTURE_FAIL_HEALTH_VERSION < fail.txt
+    ssh golem-apps deploy testapp $(cat fail.txt)    # fails; previous release is restored
+    ssh golem-apps releases testapp                  # shows the failed attempt
+    ssh golem-apps secret-unset testapp FIXTURE_FAIL_HEALTH_VERSION
+    ssh golem-apps deploy testapp $(cat fail.txt)    # now healthy
+    ssh golem-apps rollback testapp                  # and back again
+
 
 - **Deploy says the health check failed:** nothing changed for your users;
   the old release is back. Read the log lines it printed, fix, push, deploy
