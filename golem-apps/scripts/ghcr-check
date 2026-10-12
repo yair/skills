@@ -1,0 +1,39 @@
+#!/bin/sh
+# ghcr-check OWNER/REPO TAG — can golem pull this image? Run it BEFORE asking
+# for a deploy (golem-apps skill). Needs only sh and curl, so it works on any
+# node, including Windows with Git Bash (curl.exe ships with Windows 10+).
+#
+# Anonymous by default: that is how golem pulls a public package. For a
+# private package, set GHCR_USER and GHCR_TOKEN (a token with read:packages
+# only), which is what golem would be given. Never paste the token in chat.
+#
+# Prints the digest to quote in the deploy request; exit 0 = pullable.
+set -eu
+[ $# -eq 2 ] || { echo "usage: ghcr-check OWNER/REPO TAG" >&2; exit 64; }
+repo=$(printf '%s' "$1" | tr 'A-Z' 'a-z'); tag=$2
+case "$repo" in */*) ;; *) echo "ghcr-check: give OWNER/REPO, e.g. yair/golem-app-fixture" >&2; exit 64;; esac
+
+if [ -n "${GHCR_TOKEN:-}" ]; then
+  auth=$(curl -fsS -u "${GHCR_USER:-token}:$GHCR_TOKEN" "https://ghcr.io/token?scope=repository:$repo:pull") || {
+    echo "FAIL: GHCR refused the token for $repo (wrong token, or it lacks read:packages)" >&2; exit 1; }
+else
+  auth=$(curl -fsS "https://ghcr.io/token?scope=repository:$repo:pull") || {
+    echo "FAIL: no anonymous access to $repo" >&2; exit 1; }
+fi
+token=$(printf '%s' "$auth" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+accept="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json"
+accept="$accept,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+headers=$(curl -sS -o /dev/null -D - -I -H "Authorization: Bearer $token" -H "Accept: $accept" \
+  "https://ghcr.io/v2/$repo/manifests/$tag")
+code=$(printf '%s' "$headers" | sed -n '1s/^HTTP[^ ]* \([0-9]*\).*/\1/p')
+digest=$(printf '%s' "$headers" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p')
+case "$code" in
+  200) echo "OK: ghcr.io/$repo:$tag is pullable${GHCR_TOKEN:+ with the token}"; echo "digest: $digest" ;;
+  401|403)
+    if [ -n "${GHCR_TOKEN:-}" ]; then echo "FAIL: the token cannot read ghcr.io/$repo" >&2
+    else echo "FAIL: ghcr.io/$repo is private. Make the package public (GitHub > package > Package settings > Change visibility), or give golem a read-only token." >&2; fi
+    exit 1 ;;
+  404) echo "FAIL: no tag '$tag' in ghcr.io/$repo. Did the golem image workflow run green for that commit?" >&2; exit 1 ;;
+  *) echo "FAIL: unexpected answer from GHCR (HTTP $code)" >&2; exit 1 ;;
+esac
