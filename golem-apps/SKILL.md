@@ -181,14 +181,17 @@ Ask for it with the app, or later; golem's admin arranges it.
   else. Tables the owner creates in the `public` schema are automatically
   readable and writable by the app.
 - **Everything you send in one `db-sql` runs as one transaction:** if any
-  statement fails, none of it is applied. Send plain SQL only; psql's
+  statement fails, none of it is applied. The exception: if your SQL contains
+  its own `COMMIT`, what came before it stays committed even if a later
+  statement fails, so check the state before retrying. Simplest: don't put
+  `BEGIN` or `COMMIT` in it. Send plain SQL only; psql's
   backslash commands (`\d`, `\i`, `\copy` ...) are not available. To list
   tables, query `information_schema.tables`.
 
 | Command | Does |
 |---|---|
 | `db-check <app>` | connects exactly as the app does and prints the role and database |
-| `db-sql <app>` | runs SQL from standard input as the owner, as one transaction (up to 100 KB in, 1 MB out, 15 minutes); split bigger loads |
+| `db-sql <app>` | runs SQL from standard input as the owner, as one transaction unless it commits itself (up to 100 KB in, 1 MB out, 15 minutes); split bigger loads |
 | `db-dump <app>` | prints a plain-SQL dump of the whole database: save one before a risky change |
 
 **Order for a change that touches the schema:**
