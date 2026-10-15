@@ -38,6 +38,7 @@ open items, each with a `->` next action. What it checks:
 | live | files written outside any repository, unless a repository owns an identical copy |
 | procs | shell jobs the session started that are still running |
 | FOREIGN | dirty files in the same repositories that this session did not write |
+| PARKED | never blocks: untracked files hidden only by the repository's local `.git/info/exclude`. It is listed every time on purpose, as a reminder |
 
 Authorship comes from the transcript: tool writes (Write/Edit/apply_patch),
 plus the plain shell forms (`>`, `tee`, `cp`, `sed -i`, `curl -o`, …).
@@ -138,6 +139,9 @@ For each FOREIGN item, offer these options:
 - **leave deliberately**: file an Engine task for it if none exists, or
   name the task that does
 
+Repeat any PARKED lines at the end of the report, in one line each. They
+are not questions, only reminders.
+
 When the user decides to leave something open, record it with an ack
 (`closeout check --ack PATH-or-ID-or-GLOB`, repeatable). The debrief
 must state each ack's reason. Acks hold only for that run; nothing is
@@ -163,7 +167,8 @@ The body is plain prose under these headings, each short:
   ids, commits, and whether the change is deployed.
 - **Filed for later**: Engine tasks and brain todos created, with ids.
 - **Learned**: brain entries written, with ids.
-- **Left open deliberately**: each acked item, why, and who owns it now.
+- **Left open deliberately**: each acked item, why, and who owns it now,
+  plus the PARKED files still present.
 - **Session**: harness, full session id (never shortened), T3 thread title, transcript path.
 
 Show the user the same debrief, then end with one line: *Debrief filed

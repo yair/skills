@@ -371,6 +371,27 @@ def shell_write_targets(cmd, cwd):
     return out
 
 
+GIT_MUTATING = r"(?:commit|add|worktree|merge|pull|push|checkout|switch|rebase|stash|reset|rm|mv|branch|cherry-pick|revert|am|apply)"
+
+
+def git_scope_dirs(cmd, cwd):
+    """Directories a command changed through git without writing files there itself."""
+    dirs = [m.group(1) for m in re.finditer(r"\bgit\s+-C\s+(\S+)\s+" + GIT_MUTATING + r"\b", cmd)]
+    for seg in re.split(r"\n|;", cmd):
+        m = re.match(r"\s*cd\s+(\S+)\s*&&(.*)", seg)
+        if m and re.search(r"\bgit\s+" + GIT_MUTATING + r"\b", m.group(2)):
+            dirs.append(m.group(1))
+    out = []
+    for d in dirs:
+        d = d.strip("'\"")
+        if not d or BAD_PATH_CHARS & set(d):
+            continue
+        d = os.path.normpath(os.path.join(cwd or "/", os.path.expanduser(d)))
+        if os.path.isdir(d):
+            out.append(d)
+    return out
+
+
 # --------------------------------------------------------------------------
 # T3
 
@@ -426,7 +447,7 @@ def live_session_ids():
 
 @dataclass
 class Item:
-    level: str        # FAIL, AUTO, FOREIGN, OK, INFO
+    level: str        # FAIL, AUTO, FOREIGN, PARKED, OK, INFO
     area: str
     key: str
     text: str
@@ -494,6 +515,17 @@ def written_by_session(abspath, sess_writes, created_trees):
     if abspath in sess_writes or abspath.rstrip("/") in sess_writes:
         return True
     return any(abspath.startswith(t.rstrip("/") + "/") for t in created_trees)
+
+
+def parked_files(repo):
+    """Untracked files hidden only by the repository's local .git/info/exclude."""
+    rc, out, _ = run(["git", "-C", repo, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"])
+    ex = out.strip()
+    if rc != 0 or not os.path.isfile(ex):
+        return []
+    rc, out, _ = run(["git", "-C", repo, "ls-files", "--others", "--ignored", "--directory",
+                      "--exclude-from=" + ex])
+    return [f for f in out.splitlines() if f and not f.startswith(".engine")]
 
 
 def upstream_ahead(tree):
@@ -1008,6 +1040,8 @@ def print_whose(results):
         print(f"{short(r['path'])}")
         if not r["candidates"]:
             print("  author: unknown — no agent transcript since it changed mentions it (by hand, or by a tool)")
+        elif not any(c["wrote"] for c in r["candidates"]):
+            print("  (no session recorded writing it: possibly made by hand or by a tool)")
         for c in r["candidates"][:5]:
             if c["t3_title"]:
                 state = ", ".join(x for x in (c["t3_status"], "settled" if c["t3_settled"] else "") if x)
@@ -1020,8 +1054,10 @@ def print_whose(results):
                 print(f"  WROTE by {c['kind']} {c['session']} at {when}, {live}, {where}")
             else:
                 when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["first_activity"]))
-                how = "was running when it changed" if c.get("active_at_change") else f"first to see it (started {when})"
-                print(f"  no recorded write; probable: {c['kind']} {c['session']}, {how}, {live}, {where}")
+                how = ("was running when the file changed" if c.get("active_at_change")
+                       else f"is the earliest to mention it (started {when})")
+                print(f"  no recorded write. Weak lead: {c['kind']} {c['session']} only mentions the path and {how}; "
+                      f"{live}, {where}")
         for e in r["engine"]:
             print("  engine: " + e)
         for n in r["notes"]:
@@ -1115,9 +1151,14 @@ def cmd_check(args):
         t = git_toplevel(c)
         if t:
             tree_set.add(t)
+    for c in sess.commands:
+        for d in git_scope_dirs(c.cmd, c.cwd):
+            t = git_toplevel(d)
+            if t:
+                tree_set.add(t)
     created = set()
     for c in sess.commands:
-        if re.search(r"\b(git worktree add|engine (worktree new|grab))\b", c.cmd):
+        if re.search(r"\bgit\b[^;&|\n]*\bworktree\s+add\b|\bengine\s+(worktree\s+new|grab)\b", c.cmd):
             for p in shell_write_targets(c.cmd, c.cwd) + re.findall(r"(/[^\s\"']+/\.?worktrees/[^\s\"'/]+)", c.output):
                 if os.path.isdir(p):
                     created.add(os.path.realpath(p))
@@ -1128,6 +1169,11 @@ def cmd_check(args):
     repos = set(repo_trees.values())
 
     check_git(sess, rep, repos, created)
+    for repo in sorted(repos):
+        for f in parked_files(repo):
+            rep.add("PARKED", "git", os.path.join(repo, f),
+                    f"{short(repo)}: {f} — hidden by .git/info/exclude, still here",
+                    "never blocks; decide its fate when you can and closeout stops listing it")
     check_outside_writes(sess, rep, set(repo_trees) | repos, repos)
     check_engine(sess, rep, actor)
     check_deploy(sess, rep, repo_trees, routing)
@@ -1157,7 +1203,7 @@ def cmd_check(args):
     print(f"session {sess.id} ({sess.kind}), actor {actor or '?'}"
           + (f", T3 \"{th['title']}\"" if th else "")
           + f", repos: {', '.join(short(r) for r in sorted(repos)) or 'none'}")
-    order = {"FAIL": 0, "AUTO": 1, "FOREIGN": 2, "INFO": 3, "OK": 4}
+    order = {"FAIL": 0, "AUTO": 1, "FOREIGN": 2, "PARKED": 3, "INFO": 4, "OK": 5}
     n = 0
     for it in sorted(rep.items, key=lambda i: (i.acked, order[i.level], i.area)):
         if it.level in ("FAIL", "AUTO", "FOREIGN") and not it.acked:
@@ -1167,6 +1213,8 @@ def cmd_check(args):
                 print(f"      -> {it.action}")
         elif it.acked:
             print(f"    [ACKED {it.level}] {it.area}: {it.text}")
+        elif it.level == "PARKED":
+            print(f"    [PARKED] {it.area}: {it.text}")
         elif args.verbose or it.level == "INFO":
             print(f"    [{it.level}] {it.area}: {it.text}")
     print(f"({time.time() - t0:.1f}s)")
