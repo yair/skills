@@ -32,6 +32,7 @@ skills/
 | `youtube-transcript` | Fetch and clean YouTube video transcripts | 🚧 WIP |
 | `nate-analysis` | Analyze NateBJones content with Opus-level depth | 🚧 WIP |
 | `buzz-genius` | Put a genius on a self-hosted Buzz relay: identity, admission, owner vouching (NIP-OA), a native agent under Buzz's headless harness, etiquette; plus the host admin's kit that installs and self-upgrades the harness, adapter and CLI on each box | ✅ |
+| `closeout` | Gate closing an agent session: intents filed or done, Engine tasks/MRs landed, nothing uncommitted or undeployed (per each repo's deploy model), learnings in brain, then a debrief; traces other sessions' leftovers to their T3 thread and task | ✅ |
 
 ## Design Philosophy
 

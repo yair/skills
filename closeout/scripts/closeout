@@ -1,0 +1,1229 @@
+#!/usr/bin/env python3
+"""closeout: read-only checks that gate closing an agent session.
+
+  closeout check   [--session ID] [--ack GLOB]... [--json]
+  closeout whose   PATH... [--json]
+  closeout digest  [--session ID] [--max-chars N]
+  closeout session [--session ID]
+
+`check` exits 0 when the session is clean, 1 when it has blockers of its own,
+2 when the only open items are other sessions' mess, 3 on a usage or
+environment error. It never changes anything; the skill's procedure does.
+"""
+
+import argparse
+import fnmatch
+import glob
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+HOME = os.path.expanduser("~")
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+T3_DB = os.path.join(HOME, ".t3", "userdata", "state.sqlite")
+DECLARATION = ".closeout.json"
+UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+SHORT_ID_RE = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f-]{1,28})?$")
+
+# Writes under these roots are expected scratch or agent bookkeeping, not
+# changes to the machine that a repository should own.
+BENIGN_WRITE_ROOTS = [
+    "/tmp/", "/var/tmp/", "/dev/",
+    os.path.join(HOME, ".cache") + "/",
+    os.path.join(HOME, ".claude", "projects") + "/",
+    os.path.join(HOME, ".claude", "plans") + "/",
+    os.path.join(HOME, ".claude", "todos") + "/",
+    os.path.join(HOME, ".codex", "sessions") + "/",
+    os.path.join(HOME, ".codex", "memories") + "/",
+]
+
+ENGINE_TASK_VERBS = {"claim", "release", "receipt", "revise", "edit", "comment", "set-auto",
+                     "abandon", "link", "set-blocked-on", "set-priority", "checkpoint"}
+OPEN_MR_STATES = {"open", "in-review", "changes-requested", "returned", "approved",
+                  "land-failed", "landing"}
+
+
+# --------------------------------------------------------------------------
+# small utilities
+
+def run(cmd, cwd=None, timeout=30, shell=False):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, timeout=timeout, shell=shell,
+                           capture_output=True, text=True)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def have(tool):
+    return any(os.access(os.path.join(d, tool), os.X_OK)
+               for d in os.environ.get("PATH", "").split(":") if d)
+
+
+def short(path):
+    return path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def git_toplevel(path):
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    if not d:
+        return None
+    rc, out, _ = run(["git", "-C", d, "rev-parse", "--show-toplevel"])
+    return out.strip() if rc == 0 else None
+
+
+def engine_json(*args, timeout=30):
+    if not have("engine"):
+        return None
+    rc, out, _ = run(["engine", *args], timeout=timeout)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# sessions and transcripts
+
+@dataclass
+class Write:
+    path: str
+    ts: float
+    via: str
+
+
+@dataclass
+class Command:
+    cmd: str
+    ts: float
+    cwd: str
+    output: str = ""
+    background: bool = False
+
+
+@dataclass
+class Session:
+    kind: str
+    id: str
+    transcript: str
+    cwds: list = field(default_factory=list)
+    start: float = 0.0
+    end: float = 0.0
+    writes: list = field(default_factory=list)
+    commands: list = field(default_factory=list)
+    user_texts: list = field(default_factory=list)
+    agent_texts: list = field(default_factory=list)
+    tool_names: dict = field(default_factory=dict)
+
+
+def find_transcript(sid):
+    hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", sid + ".jsonl"))
+    if hits:
+        return "claude", hits[0]
+    hits = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*-" + sid + ".jsonl"))
+    if hits:
+        return "codex", hits[0]
+    return None, None
+
+
+def ancestors(pid=None):
+    pid = pid or os.getpid()
+    chain = []
+    while pid and pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            break
+        chain.append((pid, argv))
+        pid = ppid
+    return chain
+
+
+def detect_session(explicit=None):
+    """Return (kind, id, transcript, harness_pid) for the session running us."""
+    if explicit:
+        kind, path = find_transcript(explicit)
+        if not path and os.path.isfile(explicit):
+            path = explicit
+            kind = "codex" if "/.codex/" in path else "claude"
+            explicit = re.sub(r"^rollout-.*?-(?=[0-9a-f]{8}-)", "", os.path.basename(path))[:-6]
+        return kind, explicit, path, None
+    for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+        sid = os.environ.get(var)
+        if sid:
+            kind, path = find_transcript(sid)
+            if path:
+                pid = os.environ.get("CLAUDE_PID")
+                return kind, sid, path, int(pid) if pid and pid.isdigit() else None
+    for pid, argv in ancestors():
+        joined = " ".join(argv)
+        m = re.search(r"(?:--resume[= ]|--session-id[= ]|\bresume )(" + UUID_RE.pattern[2:-2] + ")", joined)
+        if m:
+            kind, path = find_transcript(m.group(1))
+            if path:
+                return kind, m.group(1), path, pid
+    # Last resort: the transcript most recently written for this directory.
+    slug = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+    cands = glob.glob(os.path.join(CLAUDE_PROJECTS, slug, "*.jsonl"))
+    cands = [c for c in cands if time.time() - os.path.getmtime(c) < 600]
+    if len(cands) == 1:
+        return "claude", os.path.basename(cands[0])[:-6], cands[0], None
+    return None, None, None, None
+
+
+def _claude_text(content):
+    if isinstance(content, str):
+        return content
+    out = []
+    for c in content or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            out.append(c.get("text", ""))
+    return "\n".join(out)
+
+
+def _tool_result_text(content):
+    if isinstance(content, str):
+        return content
+    out = []
+    for c in content or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            out.append(c.get("text", ""))
+    return "\n".join(out)
+
+
+def load_claude(path, sess):
+    files = [path] + sorted(glob.glob(os.path.join(path[:-6], "subagents", "*.jsonl")))
+    pending = {}
+    for fpath in files:
+        sub = fpath != path
+        with open(fpath, errors="replace") as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = parse_ts(o.get("timestamp")) or 0.0
+                if ts:
+                    sess.start = min(sess.start or ts, ts)
+                    sess.end = max(sess.end, ts)
+                cwd = o.get("cwd")
+                if cwd and cwd not in sess.cwds:
+                    sess.cwds.append(cwd)
+                msg = o.get("message") or {}
+                content = msg.get("content")
+                if o.get("type") == "user" and not sub:
+                    if isinstance(content, str) or any(
+                            isinstance(c, dict) and c.get("type") == "text" for c in content or []):
+                        text = _claude_text(content)
+                        if text.strip() and not o.get("isMeta") and not text.startswith("<"):
+                            sess.user_texts.append((ts, text))
+                if isinstance(content, list):
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") == "tool_result" and c.get("tool_use_id") in pending:
+                            pending.pop(c["tool_use_id"]).output = _tool_result_text(c.get("content"))[:20000]
+                        if c.get("type") == "text" and o.get("type") == "assistant" and not sub:
+                            sess.agent_texts.append((ts, c.get("text", "")))
+                        if c.get("type") != "tool_use":
+                            continue
+                        name, inp = c.get("name", ""), c.get("input") or {}
+                        sess.tool_names[name] = sess.tool_names.get(name, 0) + 1
+                        if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                            p = inp.get("file_path") or inp.get("notebook_path")
+                            if p:
+                                sess.writes.append(Write(os.path.abspath(p), ts, name))
+                        elif name == "Bash" and inp.get("command"):
+                            cmd = Command(inp["command"], ts, cwd or "", background=bool(inp.get("run_in_background")))
+                            sess.commands.append(cmd)
+                            pending[c.get("id")] = cmd
+
+
+def load_codex(path, sess):
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = parse_ts(o.get("timestamp")) or 0.0
+            if ts:
+                sess.start = min(sess.start or ts, ts)
+                sess.end = max(sess.end, ts)
+            p = o.get("payload") or {}
+            if o.get("type") in ("session_meta", "turn_context") and p.get("cwd"):
+                if p["cwd"] not in sess.cwds:
+                    sess.cwds.append(p["cwd"])
+            if o.get("type") != "event_msg" or p.get("type") != "item_completed":
+                continue
+            item = p.get("item") or {}
+            t = item.get("type")
+            sess.tool_names[t] = sess.tool_names.get(t, 0) + 1
+            if t == "UserMessage":
+                text = "\n".join(c.get("text", "") for c in item.get("content") or [] if isinstance(c, dict))
+                if text.strip():
+                    sess.user_texts.append((ts, text))
+            elif t == "AgentMessage":
+                text = "\n".join(c.get("text", "") for c in item.get("content") or [] if isinstance(c, dict))
+                sess.agent_texts.append((ts, text))
+            elif t == "FileChange":
+                for fp in (item.get("changes") or {}):
+                    sess.writes.append(Write(os.path.abspath(fp), ts, "apply_patch"))
+            elif t == "CommandExecution":
+                argv = item.get("command") or []
+                cmd = argv[-1] if len(argv) >= 3 and argv[1] in ("-lc", "-c") else " ".join(argv)
+                # Codex's own hook plumbing is not the session's work.
+                if "/hooks/" in cmd and "personal-data-guard" in cmd:
+                    continue
+                sess.commands.append(Command(cmd, ts, item.get("cwd") or (sess.cwds[0] if sess.cwds else ""),
+                                             output=str(item.get("aggregated_output") or "")[:20000]))
+
+
+def load_session(kind, sid, path):
+    sess = Session(kind, sid, path)
+    (load_claude if kind == "claude" else load_codex)(path, sess)
+    for cmd in sess.commands:
+        for p in shell_write_targets(cmd.cmd, cmd.cwd):
+            sess.writes.append(Write(p, cmd.ts, "shell"))
+    return sess
+
+
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n.*?\n\s*\2\s*(?:\n|$)", re.S)
+BAD_PATH_CHARS = set("$`*?[]{}()<>|;&'\"\\")
+
+
+def shell_write_targets(cmd, cwd):
+    """Best-effort: existing paths a shell command plainly writes. Misses are expected."""
+    cmd = HEREDOC_RE.sub("\n", cmd)
+    targets = []
+    for seg in re.split(r"&&|\|\||;|\n|(?<![>&])\|", cmd):
+        try:
+            lex = shlex.shlex(seg, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            words = list(lex)
+        except ValueError:
+            continue
+        for i, wd in enumerate(words[:-1]):
+            if wd in (">", ">>", ">|", "&>", "&>>") and not (i and words[i - 1].isdigit()):
+                targets.append(words[i + 1])
+        words = [w for w in words if not re.fullmatch(r"[0-9]*[<>&|]+", w)]
+        while words and (words[0] in ("sudo", "env", "command", "nohup", "time")
+                         or ("=" in words[0] and not words[0].startswith("-"))):
+            words = words[1:]
+            while words and words[0].startswith("-") and words[0] != "--":
+                words = words[1:]
+        if not words:
+            continue
+        prog, args = os.path.basename(words[0]), [w for w in words[1:] if not w.startswith("-")]
+        if prog == "tee":
+            targets += args
+        elif prog in ("cp", "mv", "install", "rsync", "ln") and len(args) >= 2:
+            targets.append(args[-1])
+        elif prog in ("curl", "wget"):
+            for i, wd in enumerate(words[:-1]):
+                if wd in ("-o", "--output", "-O", "--output-document"):
+                    targets.append(words[i + 1])
+        elif prog == "scp" and len(args) >= 2 and ":" not in args[-1]:
+            targets.append(args[-1])
+        elif prog == "touch":
+            targets += args
+        elif prog == "sed" and any(w.startswith("-i") or w == "--in-place" for w in words) and len(args) >= 2:
+            targets += args[1:]
+        elif prog == "git" and "worktree" in words and "add" in words:
+            i = words.index("add") + 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in ("-b", "-B") else 1
+            if i < len(words):
+                targets.append(words[i])
+    out = []
+    for t in targets:
+        if not t or t in ("/dev/null", "-", ".", "..") or BAD_PATH_CHARS & set(t):
+            continue
+        t = os.path.normpath(os.path.join(cwd or "/", os.path.expanduser(t)))
+        if os.path.isdir(t) and not os.path.isdir(os.path.join(t, ".git")) and not os.path.isfile(os.path.join(t, ".git")):
+            continue  # a directory target names where files went, not which
+        if os.path.exists(t):
+            out.append(t)
+    return out
+
+
+# --------------------------------------------------------------------------
+# T3
+
+def t3_threads():
+    """Map provider session id -> {title, status, settled, archived} (read-only)."""
+    if not os.path.exists(T3_DB):
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{T3_DB}?mode=ro", uri=True, timeout=2)
+        rows = con.execute(
+            "select t.thread_id, t.title, coalesce(s.status, ''), t.settled_at, t.archived_at, "
+            "r.resume_cursor_json, s.provider_session_id, s.provider_thread_id "
+            "from projection_threads t "
+            "left join projection_thread_sessions s using(thread_id) "
+            "left join provider_session_runtime r using(thread_id) "
+            "where t.deleted_at is null").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return {}
+    out = {}
+    for tid, title, status, settled, archived, cursor, psid, ptid in rows:
+        keys = {psid, ptid}
+        try:
+            c = json.loads(cursor or "{}")
+            keys |= {c.get("resume"), c.get("threadId"), c.get("sessionId")}
+        except json.JSONDecodeError:
+            pass
+        info = {"thread": tid, "title": title, "status": status, "settled": bool(settled),
+                "archived": bool(archived)}
+        for k in keys:
+            if k and k != tid:
+                out[k] = info
+    return out
+
+
+def live_session_ids():
+    ids = set()
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                argv = f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if "claude" in argv or "codex" in argv:
+            ids.update(UUID_RE.findall(argv))
+    return ids
+
+
+# --------------------------------------------------------------------------
+# findings
+
+@dataclass
+class Item:
+    level: str        # FAIL, AUTO, FOREIGN, OK, INFO
+    area: str
+    key: str
+    text: str
+    action: str = ""
+    acked: bool = False
+
+
+class Report:
+    def __init__(self, acks):
+        self.items = []
+        self.acks = acks
+
+    def add(self, level, area, key, text, action=""):
+        it = Item(level, area, key, text, action)
+        if level in ("FAIL", "AUTO", "FOREIGN") and any(fnmatch.fnmatch(key, a) or key.startswith(a) for a in self.acks):
+            it.acked = True
+        self.items.append(it)
+        return it
+
+    def open(self, *levels):
+        return [i for i in self.items if i.level in levels and not i.acked]
+
+
+# --------------------------------------------------------------------------
+# check: git
+
+def is_benign(path):
+    return any(path.startswith(r) for r in BENIGN_WRITE_ROOTS)
+
+
+def worktree_list(repo):
+    rc, out, _ = run(["git", "-C", repo, "worktree", "list", "--porcelain"])
+    trees, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if cur:
+                trees.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[9:]
+        elif line.startswith("branch "):
+            cur["branch"] = line[7:].replace("refs/heads/", "")
+    return trees
+
+
+def porcelain(tree):
+    rc, out, _ = run(["git", "-C", tree, "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    if rc != 0:
+        return None
+    entries, parts, i = [], out.split("\0"), 0
+    while i < len(parts):
+        e = parts[i]
+        if len(e) < 4:
+            i += 1
+            continue
+        code, rel = e[:2], e[3:]
+        if code[0] in "RC":
+            i += 1
+        entries.append((code, rel))
+        i += 1
+    return entries
+
+
+def written_by_session(abspath, sess_writes, created_trees):
+    if abspath in sess_writes or abspath.rstrip("/") in sess_writes:
+        return True
+    return any(abspath.startswith(t.rstrip("/") + "/") for t in created_trees)
+
+
+def upstream_ahead(tree):
+    rc, out, _ = run(["git", "-C", tree, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
+    if rc != 0:
+        return None
+    behind, ahead = (int(x) for x in out.split())
+    return ahead
+
+
+def check_git(sess, rep, repos_touched, created_trees):
+    write_paths = {w.path for w in sess.writes}
+    commit_cmds = [c for c in sess.commands if re.search(r"\bgit\b[^|;&]*\bcommit\b", c.cmd)]
+    for repo in sorted(repos_touched):
+        trees = worktree_list(repo) or [{"path": repo}]
+        session_wrote_repo = any(written_by_session(p, write_paths, created_trees) and p.startswith(repo + "/")
+                                 for p in write_paths)
+        for t in trees:
+            tp = t["path"]
+            if not os.path.isdir(tp):
+                continue
+            mine_tree = tp in created_trees
+            canonical = os.path.realpath(tp) == os.path.realpath(repo)
+            touched_tree = mine_tree or canonical or any(p.startswith(tp + "/") for p in write_paths)
+            if not touched_tree and not session_wrote_repo:
+                continue
+            entries = porcelain(tp)
+            if entries is None:
+                continue
+            mine, foreign = [], []
+            for code, rel in entries:
+                ab = os.path.join(tp, rel)
+                (mine if written_by_session(ab, write_paths, created_trees) else foreign).append((code, rel))
+            for code, rel in mine:
+                rep.add("FAIL", "git", os.path.join(tp, rel),
+                        f"{short(tp)}: {rel} [{code.strip() or '??'}] — left uncommitted by this session",
+                        "commit it on the task branch (worktree), or delete it if it was scratch")
+            for code, rel in foreign:
+                rep.add("FOREIGN", "git", os.path.join(tp, rel),
+                        f"{short(tp)}: {rel} [{code.strip() or '??'}] — not written by this session",
+                        f"closeout whose {shlex.quote(os.path.join(tp, rel))}")
+            if not entries and (mine_tree or canonical):
+                rep.add("OK", "git", tp, f"{short(tp)}: clean")
+            ahead = upstream_ahead(tp)
+            if ahead:
+                ran_commit = any(c.cwd.startswith(tp) or tp in c.cmd for c in commit_cmds)
+                level = "FAIL" if (ran_commit or mine_tree) else "FOREIGN"
+                rep.add(level, "git", tp + "@ahead",
+                        f"{short(tp)} ({t.get('branch', '?')}): {ahead} commit(s) not on its upstream",
+                        "submit through the engine (engine submit) or push if this repository is not engine-managed"
+                        if level == "FAIL" else f"git -C {shlex.quote(tp)} log @{{upstream}}..HEAD")
+
+
+def repo_counterpart(live, repos):
+    """A tracked repository file whose path ends with the live path's tail."""
+    parts = live.strip("/").split("/")
+    best = None
+    for repo in repos:
+        rc, out, _ = run(["git", "-C", repo, "ls-files"])
+        for rel in out.splitlines():
+            rp = rel.split("/")
+            n = 0
+            while n < min(len(rp), len(parts)) and rp[-1 - n] == parts[-1 - n]:
+                n += 1
+            if n >= 2 and (not best or n > best[0]):
+                best = (n, repo, rel)
+    return best[1:] if best else None
+
+
+def same_bytes(a, b):
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return None
+
+
+def check_outside_writes(sess, rep, repos_touched, canon_repos):
+    seen = set()
+    for w in sess.writes:
+        p = w.path
+        if p in seen or is_benign(p) or any(p == r or p.startswith(r + "/") for r in repos_touched):
+            continue
+        seen.add(p)
+        if not os.path.exists(p) or git_toplevel(p):
+            continue
+        twin = repo_counterpart(p, canon_repos)
+        if twin:
+            repo, rel = twin
+            same = same_bytes(p, os.path.join(repo, rel))
+            if same:
+                rep.add("OK", "live", p, f"{short(p)} matches {short(repo)}/{rel}")
+            elif same is None:
+                rep.add("INFO", "live", p, f"{short(p)} has counterpart {short(repo)}/{rel}; could not compare (permissions?)")
+            else:
+                rep.add("FAIL", "live", p, f"{short(p)} differs from {short(repo)}/{rel}",
+                        "land the repository copy and deploy it, or bring the repository copy in line")
+            continue
+        rep.add("FAIL", "live", p,
+                f"{short(p)} written ({w.via}) outside any repository",
+                "make a repository own it (config + installer), or --ack it with the reason in the debrief")
+
+
+# --------------------------------------------------------------------------
+# check: engine
+
+def session_actor(sess):
+    counts = {}
+    for c in sess.commands:
+        if not re.search(r"(^|[\s;&|(])engine\s", c.cmd):
+            continue
+        for m in re.finditer(r"--by[= ]([A-Za-z0-9:._@-]+)", c.cmd):
+            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def session_engine_ids(sess):
+    """Task ids this session acted on as owner/claimant, and tasks it merely filed."""
+    acted, filed = set(), set()
+    for c in sess.commands:
+        for seg in re.split(r"&&|\|\||;|\n", c.cmd):
+            try:
+                w = shlex.split(seg)
+            except ValueError:
+                continue
+            if "engine" not in [os.path.basename(x) for x in w[:3]]:
+                continue
+            w = w[[os.path.basename(x) for x in w].index("engine") + 1:]
+            if not w:
+                continue
+            ids_in_out = UUID_RE.findall(c.output)
+            if w[0] == "task" and len(w) > 2 and w[1] == "new":
+                filed.update(ids_in_out[:1])
+            elif w[0] == "task" and len(w) > 2 and w[1] in ENGINE_TASK_VERBS:
+                acted.add(w[2])
+            elif w[0] == "grab":
+                acted.update(ids_in_out[:1])
+            elif w[0] in ("submit", "enter") and len(w) > 1:
+                acted.add(w[1])
+            elif w[0] == "worktree" and len(w) > 2 and w[1] == "new":
+                acted.add(w[2])
+            elif w[0] == "repo" and len(w) > 3 and w[1] == "lock" and w[2] == "acquire" and "--task" in w:
+                acted.add(w[w.index("--task") + 1])
+    acted = {a for a in acted if SHORT_ID_RE.match(a)}
+    return acted, filed - acted
+
+
+def check_engine(sess, rep, actor):
+    if not have("engine"):
+        rep.add("INFO", "engine", "engine", "engine CLI not installed here; engine checks skipped")
+        return []
+    acted, filed = session_engine_ids(sess)
+    if not acted and not filed:
+        rep.add("OK", "engine", "engine", "this session did not touch engine tasks")
+        return []
+    mrs = engine_json("mr", "list") or []
+    tasks = []
+    for tid in sorted(acted):
+        t = engine_json("task", "show", tid)
+        if not t:
+            rep.add("FAIL", "engine", tid, f"task {tid}: could not be read", "engine task show " + tid)
+            continue
+        tasks.append(t)
+        full, title = t["id"], t["title"][:70]
+        mine = [m for m in mrs if m.get("task_id") == full]
+        live = [m for m in mine if m.get("status") in OPEN_MR_STATES]
+        if t["status"] in ("done", "abandoned"):
+            rep.add("OK", "engine", full, f"task {full[:8]} {t['status']}: {title}")
+            continue
+        for m in live:
+            st, mid = m["status"], m["id"]
+            if st == "approved":
+                rep.add("AUTO", "engine", mid,
+                        f"MR {mid[:8]} (task {full[:8]}) is approved but not landed",
+                        f"engine mr land {mid} --by {actor or 'ACTOR'}")
+            elif st in ("changes-requested", "returned", "land-failed"):
+                rep.add("FAIL", "engine", mid, f"MR {mid[:8]} (task {full[:8]}) is {st}: {title}",
+                        f"engine mr read {mid}  — fix and refresh, or abandon")
+            else:
+                verdict = m.get("reviewer_verdict") or "pending"
+                rep.add("FAIL", "engine", mid,
+                        f"MR {mid[:8]} (task {full[:8]}) is {st}, review {verdict}: {title}",
+                        "adjudicate it now, or --ack to leave it in the queue deliberately")
+        if not live:
+            claimed = t.get("claimed_by")
+            if claimed and (not actor or claimed == actor or claimed.split(":")[0] == actor.split(":")[0]):
+                rep.add("FAIL", "engine", full, f"task {full[:8]} is {t['status']}, claimed by {claimed}, with no live MR: {title}",
+                        "submit the work, close it with a receipt, or release the claim (engine task release)")
+            else:
+                rep.add("INFO", "engine", full, f"task {full[:8]} is {t['status']} ({claimed or 'unclaimed'}): {title}")
+    for tid in sorted(filed):
+        t = engine_json("task", "show", tid)
+        if t:
+            rep.add("OK", "engine", t["id"], f"filed task {t['id'][:8]} ({t['status']}, genius {t.get('genius') or '?'}): {t['title'][:70]}")
+    locks = engine_json("repo", "lock", "status") or []
+    for lk in locks.get("locks", []) if isinstance(locks, dict) else locks:
+        holder = lk.get("holder")
+        if lk.get("held") and holder and ((lk.get("holder_task_id") or "")[:8] in {a[:8] for a in acted}
+                                          or (actor and holder == actor)):
+            rep.add("FAIL", "engine", "lock:" + str(lk.get("repo")),
+                    f"in-place lock on {lk.get('repo')} still held by {holder}",
+                    "capture and submit, or release it with the reason recorded")
+    return tasks
+
+
+# --------------------------------------------------------------------------
+# check: deploy
+
+def routing_repos():
+    path = os.path.join(HOME, "w", "engine", "routing.json")
+    try:
+        with open(path) as f:
+            return json.load(f).get("repos") or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def repo_policy(repo, routing):
+    real = os.path.realpath(repo)
+    for name, pol in routing.items():
+        p = pol.get("path")
+        if p and os.path.realpath(os.path.expanduser(p)) == real:
+            return name, pol
+    return None, {}
+
+
+def canonical_of(tree):
+    rc, out, _ = run(["git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if rc != 0:
+        return tree
+    common = out.strip()
+    return os.path.dirname(common) if common.endswith("/.git") else tree
+
+
+DEFAULT_INSTALLERS = ["scripts/install-*.sh", "scripts/setup-*.sh", "scripts/configure-*.sh"]
+
+
+def deploy_model(repo, routing):
+    """Return (model, source, decl) for a canonical checkout."""
+    decl_path = os.path.join(repo, DECLARATION)
+    if os.path.isfile(decl_path):
+        try:
+            with open(decl_path) as f:
+                decl = json.load(f)
+            return decl.get("deploy", {}).get("model", "none"), "declared", decl
+        except (OSError, json.JSONDecodeError) as e:
+            return "invalid", f"{DECLARATION} unreadable: {e}", {}
+    name, pol = repo_policy(repo, routing)
+    if pol.get("work_mode") == "in-place":
+        return "in-place", f"engine routing ({name})", {}
+    for d in ("bin", "sbin", "scripts", "."):
+        for exe in sorted(glob.glob(os.path.join(repo, d, "*-deploy"))):
+            try:
+                with open(exe, errors="replace") as f:
+                    if "--check" in f.read():
+                        rel = os.path.relpath(exe, repo)
+                        return "manifest", f"detected {rel}", {"deploy": {
+                            "check": f"sudo -n {os.path.basename(exe)} --check",
+                            "apply": f"sudo {os.path.basename(exe)}"}}
+            except OSError:
+                pass
+    found = [g for g in DEFAULT_INSTALLERS if glob.glob(os.path.join(repo, g))]
+    if found:
+        return "scripts", "detected " + ", ".join(found), {"deploy": {"installers": found}}
+    return "none", "nothing deployable detected", {}
+
+
+def session_changed_rel(sess, repo_trees):
+    """Repo-relative paths this session wrote, per canonical repo."""
+    out = {}
+    for w in sess.writes:
+        for tree, canon in repo_trees.items():
+            if w.path.startswith(tree + "/"):
+                out.setdefault(canon, {})[os.path.relpath(w.path, tree)] = max(
+                    w.ts, out.get(canon, {}).get(os.path.relpath(w.path, tree), 0))
+    return out
+
+
+def check_deploy(sess, rep, repo_trees, routing):
+    changed = session_changed_rel(sess, repo_trees)
+    for canon in sorted(set(repo_trees.values())):
+        rels = changed.get(canon, {})
+        model, source, decl = deploy_model(canon, routing)
+        dep = decl.get("deploy", {}) if isinstance(decl, dict) else {}
+        label = f"{short(canon)}: deploy model {model} ({source})"
+        if model == "invalid":
+            rep.add("FAIL", "deploy", canon + "#decl", label, f"fix {DECLARATION}")
+            continue
+        if not rels:
+            rep.add("INFO", "deploy", canon, label + "; this session changed nothing here")
+            continue
+        if model == "none":
+            rep.add("OK", "deploy", canon, label)
+        elif model == "in-place":
+            rep.add("INFO", "deploy", canon,
+                    label + "; edits are live when saved — the lock and capture checks above cover them")
+        elif model in ("manifest", "custom") or dep.get("check"):
+            chk = dep.get("check")
+            if not chk:
+                rep.add("FAIL", "deploy", canon, label + " but no check command is declared",
+                        f"add deploy.check to {DECLARATION}")
+                continue
+            rc, out, err = run(chk, cwd=canon, timeout=120, shell=True)
+            tail = (out + err).strip().splitlines()[-6:]
+            if rc == 0:
+                rep.add("OK", "deploy", canon, label + f"; `{chk}` clean")
+            else:
+                rep.add("FAIL", "deploy", canon,
+                        label + f"; `{chk}` exit {rc}: " + " | ".join(tail),
+                        (dep.get("apply") or "deploy") + " after the change lands" +
+                        (" (needs sudo)" if "sudo -n" in chk and "password" in (err or "") else ""))
+        elif model == "scripts":
+            patterns = dep.get("installers", DEFAULT_INSTALLERS)
+            patterns = [patterns] if isinstance(patterns, str) else patterns
+            installers = sorted({i for pat in patterns for i in glob.glob(os.path.join(canon, pat))})
+            ran = [(c.ts, c.cmd) for c in sess.commands]
+            for rel, last_edit in sorted(rels.items()):
+                if rel.startswith(("docs/", "plans/")) or rel.endswith(".md"):
+                    continue
+                owners = []
+                for inst in installers:
+                    try:
+                        with open(inst, errors="replace") as f:
+                            body = f.read()
+                    except OSError:
+                        continue
+                    if rel in body or os.path.basename(rel) in body or os.path.relpath(inst, canon) == rel:
+                        owners.append(os.path.relpath(inst, canon))
+                if not owners:
+                    if rel.startswith(("config/", "services/")):
+                        rep.add("FAIL", "deploy", f"{canon}/{rel}",
+                                f"{short(canon)}: {rel} changed but no installer references it",
+                                "add it to an installer (or declare the deploy model) and deploy it")
+                    continue
+                done = [o for o in owners if any(ts > last_edit and os.path.basename(o) in cmd for ts, cmd in ran)]
+                if done:
+                    rep.add("OK", "deploy", f"{canon}/{rel}", f"{short(canon)}: {rel} deployed by {done[0]}")
+                else:
+                    rep.add("FAIL", "deploy", f"{canon}/{rel}",
+                            f"{short(canon)}: {rel} changed; {', '.join(owners)} not run since",
+                            f"after it lands: {owners[0]}" + (f"  ({dep['apply']})" if dep.get("apply") else ""))
+        else:
+            rep.add("FAIL", "deploy", canon, label + " — unknown model", f"fix {DECLARATION}")
+
+
+# --------------------------------------------------------------------------
+# check: processes
+
+def descendants(root):
+    children = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(d))
+    out, stack = [], [root]
+    while stack:
+        p = stack.pop()
+        for c in children.get(p, []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def check_processes(sess, rep, harness_pid):
+    bg = [c for c in sess.commands if c.background]
+    if not harness_pid:
+        for c in bg:
+            rep.add("INFO", "procs", "bg:" + c.cmd[:40], f"background job started: {c.cmd[:100]}",
+                    "confirm it finished or was stopped")
+        return
+    mine = {p for p, _ in ancestors()}
+    running = []
+    for pid in descendants(harness_pid):
+        if pid in mine:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) in ("bash", "sh", "zsh") and "-c" in argv[:3]:
+            running.append((pid, " ".join(argv)))
+    for pid, cmdline in running:
+        body = cmdline.split("eval", 1)[-1][:120]
+        rep.add("FAIL", "procs", f"pid:{pid}", f"still running under this session: pid {pid} {body}",
+                f"stop it (TaskStop / kill {pid}) or --ack pid:{pid} if it must outlive the session")
+    if not running:
+        rep.add("OK", "procs", "procs", "no shell jobs still running under this session")
+
+
+# --------------------------------------------------------------------------
+# whose
+
+def transcripts_active_at(ts, slack=3600):
+    out = []
+    for root, pat in ((CLAUDE_PROJECTS, "*/*.jsonl"), (CODEX_SESSIONS, "*/*/*/*.jsonl")):
+        for p in glob.glob(os.path.join(root, pat)):
+            try:
+                if os.path.getmtime(p) >= ts - slack:
+                    out.append(p)
+            except OSError:
+                pass
+    for p in glob.glob(os.path.join(CLAUDE_PROJECTS, "*/*/subagents/*.jsonl")):
+        try:
+            if os.path.getmtime(p) >= ts - slack:
+                out.append(p)
+        except OSError:
+            pass
+    return out
+
+
+def session_id_of(path):
+    if "/subagents/" in path:
+        return os.path.basename(os.path.dirname(os.path.dirname(path)))
+    b = os.path.basename(path)[:-6]
+    m = UUID_RE.search(b)
+    return m.group(0) if m else b
+
+
+GENERIC_STEMS = {"skill", "readme", "index", "main", "config", "install", "setup", "test",
+                 "tests", "notes", "todo", "rules", "claude", "agents", "changelog", "makefile"}
+
+
+def whose(paths, budget=20.0, exclude=()):
+    started = time.time()
+    threads = t3_threads()
+    live = live_session_ids()
+    tasks = engine_json("task", "list") or []
+    mrs = engine_json("mr", "list") or []
+    results = []
+    for raw in paths:
+        p = os.path.abspath(os.path.expanduser(raw))
+        res = {"path": p, "candidates": [], "engine": [], "notes": []}
+        try:
+            mtime = os.path.getmtime(p)
+            res["notes"].append("modified " + time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)))
+        except OSError:
+            mtime = time.time() - 30 * 86400
+            res["notes"].append("path does not exist now; searched the last 30 days")
+        top = git_toplevel(p)
+        if top:
+            rc, br, _ = run(["git", "-C", top, "branch", "--show-current"])
+            br = br.strip()
+            for m in mrs:
+                if br and m.get("branch") == br:
+                    res["engine"].append(f"worktree branch {br} -> MR {m['id'][:8]} {m['status']} (task {m['task_id'][:8]})")
+            rc, log, _ = run(["git", "-C", top, "log", "-1", "--format=%h %an %ar: %s", "--", p])
+            if log.strip():
+                res["notes"].append("last commit touching it: " + log.strip())
+        keys = [short(os.path.dirname(p)).lower() + "/" + os.path.basename(p).lower()]
+        if top:
+            keys.append(os.path.relpath(p, top).lower())
+        stem = re.sub(r"\.[^.]+$", "", os.path.basename(p)).lower()
+        if len(stem) >= 5 and stem not in GENERIC_STEMS:
+            keys += [stem, stem.replace("-", " ").replace("_", " ")]
+        else:  # a generic name says nothing; its directory might
+            keys.append(short(os.path.dirname(p)).lower())
+        for t in tasks:
+            title = t.get("title", "").lower()
+            if any(k in title for k in keys):
+                res["engine"].append(f"open task {t['id'][:8]} ({t['status']}, {t.get('claimed_by') or 'unclaimed'}, "
+                                     f"genius {t.get('genius')}): {t['title'][:80]}")
+        cands = transcripts_active_at(mtime)
+        needle = p.encode()
+        rel_needle = os.path.relpath(p, top).encode() if top else None
+        for tp in cands:
+            if time.time() - started > budget:
+                res["notes"].append(f"search budget of {budget:.0f}s exhausted; results may be partial")
+                break
+            try:
+                with open(tp, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if needle not in data and not (rel_needle and rel_needle in data and top.encode() in data):
+                continue
+            sid = session_id_of(tp)
+            if sid in exclude:
+                continue
+            kind = "codex" if tp.startswith(CODEX_SESSIONS) else "claude"
+            s = load_session(kind, sid, tp)
+            wrote = [w for w in s.writes if w.path == p]
+            info = threads.get(sid, {})
+            res["candidates"].append({
+                "session": sid, "kind": kind, "transcript": tp,
+                "wrote": bool(wrote), "last_write": max((w.ts for w in wrote), default=None),
+                "t3_title": info.get("title"), "t3_status": info.get("status"),
+                "t3_settled": info.get("settled"), "live": sid in live or info.get("status") == "running",
+                "last_activity": s.end, "first_activity": s.start,
+            })
+        # Writers first, newest write first. Sessions that merely mention the
+        # path (usually in `git status` output) only bound when it appeared,
+        # so keep the earliest such sighting and drop the rest.
+        writers = sorted((c for c in res["candidates"] if c["wrote"]), key=lambda c: -c["last_write"])
+        seen = sorted((c for c in res["candidates"] if not c["wrote"]),
+                      key=lambda c: (not (c["first_activity"] - 60 <= mtime <= c["last_activity"] + 60),
+                                     c["first_activity"]))
+        for c in seen:
+            c["active_at_change"] = c["first_activity"] - 60 <= mtime <= c["last_activity"] + 60
+        res["candidates"] = writers + seen[:1]
+        results.append(res)
+    return results
+
+
+def print_whose(results):
+    for r in results:
+        print(f"{short(r['path'])}")
+        if not r["candidates"]:
+            print("  author: unknown — no agent transcript since it changed mentions it (by hand, or by a tool)")
+        for c in r["candidates"][:5]:
+            if c["t3_title"]:
+                state = ", ".join(x for x in (c["t3_status"], "settled" if c["t3_settled"] else "") if x)
+                where = f'T3 "{c["t3_title"]}" ({state or "unknown"})'
+            else:
+                where = "not a T3 thread"
+            live = "LIVE" if c["live"] else "not running"
+            if c["wrote"]:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last_write"]))
+                print(f"  WROTE by {c['kind']} {c['session']} at {when}, {live}, {where}")
+            else:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["first_activity"]))
+                how = "was running when it changed" if c.get("active_at_change") else f"first to see it (started {when})"
+                print(f"  no recorded write; probable: {c['kind']} {c['session']}, {how}, {live}, {where}")
+        for e in r["engine"]:
+            print("  engine: " + e)
+        for n in r["notes"]:
+            print("  note: " + n)
+
+
+# --------------------------------------------------------------------------
+# digest
+
+INTENT_RE = re.compile(
+    r"\b(todo|later|follow[- ]?up|next time|should also|we should|we'll need|need to|"
+    r"file (?:a|it as a|an) (?:task|issue)|remember|don't forget|park(?:ed)?|defer|"
+    r"out of scope|not now|another session|left (?:for|as)|tbd)\b", re.I)
+
+
+def digest(sess, max_chars):
+    out = []
+    out.append(f"# session {sess.id} ({sess.kind})  {short(sess.transcript)}")
+    out.append(f"cwd: {', '.join(short(c) for c in sess.cwds[:4])}")
+    out.append(f"span: {time.strftime('%Y-%m-%d %H:%M', time.localtime(sess.start))} -> "
+               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(sess.end))}")
+    out.append("tools: " + ", ".join(f"{k}×{v}" for k, v in sorted(sess.tool_names.items(), key=lambda kv: -kv[1])[:15]))
+    out.append("\n## user messages")
+    for ts, text in sess.user_texts:
+        out.append(f"[{time.strftime('%H:%M', time.localtime(ts))}] " + text.strip()[:4000])
+    out.append("\n## intent-like lines (user and agent)")
+    for who, texts in (("user", sess.user_texts), ("agent", sess.agent_texts)):
+        for ts, text in texts:
+            for line in text.splitlines():
+                if INTENT_RE.search(line) and len(line.strip()) > 12:
+                    out.append(f"- {who} {time.strftime('%H:%M', time.localtime(ts))}: {line.strip()[:300]}")
+    out.append("\n## files written")
+    for p in sorted({w.path for w in sess.writes}):
+        out.append("- " + short(p))
+    out.append("\n## state-changing commands (engine, brain, git, deploy, sudo)")
+    for c in sess.commands:
+        if re.search(r"\b(engine (task|mr|submit|grab|worktree|repo lock)|brain (remember|update|supersede|forget)|"
+                     r"git (commit|push|worktree)|sudo |install-|-deploy)\b", c.cmd):
+            out.append(f"- {time.strftime('%H:%M', time.localtime(c.ts))} " + c.cmd.strip().replace("\n", " ⏎ ")[:300])
+    out.append("\n## brain writes seen")
+    n = 0
+    for name, cnt in sess.tool_names.items():
+        if "brain" in name and any(v in name for v in ("remember", "update", "supersede")):
+            out.append(f"- MCP {name} ×{cnt}")
+            n += 1
+    for c in sess.commands:
+        if re.search(r"\bbrain (remember|update|supersede)\b", c.cmd):
+            m = re.search(r"--title[= ](\"[^\"]*\"|'[^']*'|\S+)", c.cmd)
+            out.append("- " + (m.group(1) if m else c.cmd[:120]))
+            n += 1
+    if not n:
+        out.append("- none")
+    out.append("\n## last agent messages")
+    for ts, text in sess.agent_texts[-3:]:
+        out.append(f"[{time.strftime('%H:%M', time.localtime(ts))}] " + text.strip()[:1500])
+    text = "\n".join(out)
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n… truncated at {max_chars} chars (raise --max-chars)"
+    return text
+
+
+# --------------------------------------------------------------------------
+# main
+
+def resolve(args):
+    kind, sid, path, harness = detect_session(args.session)
+    if not path:
+        sys.exit("closeout: cannot identify this session's transcript; pass --session ID "
+                 "(Claude: $CLAUDE_CODE_SESSION_ID; Codex: the rollout id)")
+    return load_session(kind, sid, path), harness
+
+
+def cmd_check(args):
+    t0 = time.time()
+    try:
+        sess, harness = resolve(args)
+    except SystemExit as e:
+        print(e, file=sys.stderr)
+        return 3
+    rep = Report(args.ack or [])
+    actor = args.actor or session_actor(sess)
+    routing = routing_repos()
+
+    # Repositories the session touched: where it wrote, and where it worked.
+    tree_set = set()
+    for w in sess.writes:
+        t = git_toplevel(w.path)
+        if t:
+            tree_set.add(t)
+    for c in sess.cwds:
+        t = git_toplevel(c)
+        if t:
+            tree_set.add(t)
+    created = set()
+    for c in sess.commands:
+        if re.search(r"\b(git worktree add|engine (worktree new|grab))\b", c.cmd):
+            for p in shell_write_targets(c.cmd, c.cwd) + re.findall(r"(/[^\s\"']+/\.?worktrees/[^\s\"'/]+)", c.output):
+                if os.path.isdir(p):
+                    created.add(os.path.realpath(p))
+                    t = git_toplevel(p)
+                    if t:
+                        tree_set.add(t)
+    repo_trees = {t: canonical_of(t) for t in tree_set}
+    repos = set(repo_trees.values())
+
+    check_git(sess, rep, repos, created)
+    check_outside_writes(sess, rep, set(repo_trees) | repos, repos)
+    check_engine(sess, rep, actor)
+    check_deploy(sess, rep, repo_trees, routing)
+    check_processes(sess, rep, harness)
+
+    threads = t3_threads()
+    th = threads.get(sess.id, {})
+    fails, autos, foreign = rep.open("FAIL"), rep.open("AUTO"), rep.open("FOREIGN")
+    acked = [i for i in rep.items if i.acked]
+    if fails or autos:
+        verdict, code = f"NEEDS WORK ({len(fails)} blocker(s), {len(autos)} doable without you, {len(foreign)} foreign)", 1
+    elif foreign:
+        verdict, code = f"NEEDS YOU ({len(foreign)} item(s) from other sessions)", 2
+    else:
+        verdict, code = "CLEAN", 0
+
+    if args.json:
+        print(json.dumps({
+            "verdict": verdict, "exit": code, "session": sess.id, "kind": sess.kind,
+            "transcript": sess.transcript, "actor": actor, "t3": th,
+            "repos": sorted(repos), "elapsed_s": round(time.time() - t0, 2),
+            "items": [i.__dict__ for i in rep.items],
+        }, indent=1))
+        return code
+
+    print(verdict)
+    print(f"session {sess.id} ({sess.kind}), actor {actor or '?'}"
+          + (f", T3 \"{th['title']}\"" if th else "")
+          + f", repos: {', '.join(short(r) for r in sorted(repos)) or 'none'}")
+    order = {"FAIL": 0, "AUTO": 1, "FOREIGN": 2, "INFO": 3, "OK": 4}
+    n = 0
+    for it in sorted(rep.items, key=lambda i: (i.acked, order[i.level], i.area)):
+        if it.level in ("FAIL", "AUTO", "FOREIGN") and not it.acked:
+            n += 1
+            print(f"{n:>2}. [{it.level}] {it.area}: {it.text}")
+            if it.action:
+                print(f"      -> {it.action}")
+        elif it.acked:
+            print(f"    [ACKED {it.level}] {it.area}: {it.text}")
+        elif args.verbose or it.level == "INFO":
+            print(f"    [{it.level}] {it.area}: {it.text}")
+    print(f"({time.time() - t0:.1f}s)")
+    return code
+
+
+def cmd_whose(args):
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
+    res = whose(args.paths, budget=args.budget, exclude={me} if me else set())
+    if args.json:
+        print(json.dumps(res, indent=1))
+    else:
+        print_whose(res)
+    return 0
+
+
+def cmd_digest(args):
+    sess, _ = resolve(args)
+    print(digest(sess, args.max_chars))
+    return 0
+
+
+def cmd_session(args):
+    sess, harness = resolve(args)
+    th = t3_threads().get(sess.id, {})
+    print(json.dumps({"session": sess.id, "kind": sess.kind, "transcript": sess.transcript,
+                      "harness_pid": harness, "actor": session_actor(sess), "cwds": sess.cwds, "t3": th}, indent=1))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="closeout", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="gate: is this session clean to close?")
+    c.add_argument("--session", help="session id or transcript path (default: detect)")
+    c.add_argument("--actor", help="engine actor of this session (default: most used --by)")
+    c.add_argument("--ack", action="append", metavar="KEY",
+                   help="accept an open item deliberately (path, id, or glob); repeatable")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("-v", "--verbose", action="store_true", help="also list passing checks")
+    c.set_defaults(fn=cmd_check)
+    w = sub.add_parser("whose", help="find the session and task behind a path")
+    w.add_argument("paths", nargs="+")
+    w.add_argument("--budget", type=float, default=20.0, help="seconds to spend searching transcripts")
+    w.add_argument("--json", action="store_true")
+    w.set_defaults(fn=cmd_whose)
+    d = sub.add_parser("digest", help="compact view of the session for the intent and knowledge sweep")
+    d.add_argument("--session")
+    d.add_argument("--max-chars", type=int, default=60000)
+    d.set_defaults(fn=cmd_digest)
+    s = sub.add_parser("session", help="print the detected session")
+    s.add_argument("--session")
+    s.set_defaults(fn=cmd_session)
+    args = ap.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()
