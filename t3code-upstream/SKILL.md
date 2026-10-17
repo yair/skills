@@ -199,6 +199,12 @@ a working link could silently move to another file.
   does.
 - A fresh browser profile is not paired. The symptom is WebSocket "HTTP
   Authentication failed" in the console and an empty app.
+- The repo's toolchain needs no global install: `pnpm install`, then
+  `npx vp …`. Don't run tool installers (vite.plus, nvm, rustup and the
+  like) that edit shell rc files or `~/.config`. Those files are chezmoi
+  dotfiles shared by every machine, and an edit there pages each host's
+  updater until someone merges it. If a tool must be on PATH, set it in
+  the command and tell Yair.
 - Yair's install trails main. Before calling something a bug, check whether
   main has already fixed it: find the fixing commit and run
   `git tag --contains`.
