@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""lintdiff — lint diagnostics a branch adds over its base, per file.
+
+    lintdiff [--checkout DIR] [--base REF] [FILE ...]
+
+Main already carries many warnings, so the useful question is what the branch
+adds. Without FILE arguments it takes the .ts/.tsx files changed since the
+merge base with --base (default origin/main). Modified files are linted at
+the branch, then at the base, in place; new files are linted once and must be
+clean. Diagnostics are compared as (file, rule, message), ignoring line moves.
+
+Refuses to run while any modified file has staged or unstaged changes, and
+always restores the branch's versions, so nothing uncommitted can be lost.
+Exits 1 when the branch adds diagnostics or lint itself fails.
+"""
+
+import argparse
+import collections
+import json
+import os
+import subprocess
+import sys
+
+
+def run(args, cwd, check=True):
+    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        sys.exit(f"lintdiff: {' '.join(args)} failed:\n{result.stderr.strip()}")
+    return result
+
+
+def lint(files, cwd):
+    result = run(["npx", "vp", "lint", "--format", "json", *files], cwd, check=False)
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"lintdiff: lint produced no JSON (exit {result.returncode}):\n"
+                 f"{result.stdout[-1500:]}{result.stderr[-1500:]}")
+    if report.get("number_of_files") != len(files):
+        sys.exit(f"lintdiff: lint checked {report.get('number_of_files')} files, expected {len(files)}")
+    return collections.Counter(
+        (d.get("filename"), d.get("code"), d.get("severity"), d.get("message"))
+        for d in report.get("diagnostics", [])
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkout", default=os.path.expanduser(os.environ.get("T3_CHECKOUT", "~/w/t3code")))
+    parser.add_argument("--base", default="origin/main")
+    parser.add_argument("files", nargs="*")
+    args = parser.parse_args()
+    cwd = os.path.realpath(args.checkout)
+
+    merge_base = run(["git", "merge-base", "HEAD", args.base], cwd).stdout.strip()
+    if args.files:
+        files = args.files
+    else:
+        changed = run(["git", "diff", "--name-only", "--diff-filter=AM", merge_base, "HEAD"], cwd).stdout.split()
+        files = [f for f in changed if f.endswith((".ts", ".tsx"))]
+    if not files:
+        sys.exit("lintdiff: no .ts/.tsx files to compare")
+
+    def exists_at_base(path):
+        return run(["git", "cat-file", "-e", f"{merge_base}:{path}"], cwd, check=False).returncode == 0
+
+    modified = [f for f in files if exists_at_base(f)]
+    added = [f for f in files if f not in modified]
+
+    if modified:
+        dirty = run(["git", "status", "--porcelain", "--", *modified], cwd).stdout.strip()
+        if dirty:
+            sys.exit(f"lintdiff: commit or stash these first; they are swapped to the base during the run:\n{dirty}")
+
+    new = collections.Counter()
+    if added:
+        new += lint(added, cwd)
+    if modified:
+        branch = lint(modified, cwd)
+        try:
+            run(["git", "checkout", merge_base, "--", *modified], cwd)
+            base = lint(modified, cwd)
+        finally:
+            run(["git", "checkout", "HEAD", "--", *modified], cwd)
+        new += branch - base
+
+    print(f"compared {len(modified)} modified and {len(added)} new files against {args.base} ({merge_base[:9]})")
+    if not new:
+        print("no new diagnostics")
+        return
+    for (filename, code, severity, message), count in sorted(new.items(), key=lambda kv: str(kv[0])):
+        print(f"{count}x {severity} {filename}: {code} {message}")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

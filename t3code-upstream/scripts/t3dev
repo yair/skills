@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# t3dev — run a t3code checkout's dev server against throwaway state, safely
+# from inside a live T3 session.
+#
+#   t3dev start [--home DIR] [--checkout DIR]   start web + server, print URLs
+#   t3dev pair-url [--home DIR]                  print the latest pairing URL
+#   t3dev stop  [--home DIR] [--checkout DIR]   stop the session it started
+#   t3dev status [--home DIR]
+#
+# Defaults: --home /tmp/t3dev/home (or $T3DEV_HOME), --checkout ~/w/t3code
+# (or $T3_CHECKOUT).
+#
+# Why this exists: an agent running under the live T3 inherits T3CODE_HOST,
+# T3CODE_PORT and T3CODE_HOME from the service. Passed through, they point the
+# dev server at the live install's port and state. The server is started in a
+# session of its own, and stop signals exactly that session, which also reaps
+# `vp dev` and `node --watch` children that outlive the runner.
+set -euo pipefail
+
+die() { echo "t3dev: $*" >&2; exit 1; }
+
+cmd="${1:-}"; shift || true
+home="${T3DEV_HOME:-/tmp/t3dev/home}"
+checkout="${T3_CHECKOUT:-$HOME/w/t3code}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --home) home="$2"; shift 2 ;;
+    --checkout) checkout="$2"; shift 2 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+
+home=$(realpath -m -- "$home")
+checkout=$(realpath -e -- "$checkout" 2>/dev/null) || die "no checkout at ${T3_CHECKOUT:-$HOME/w/t3code}"
+# Never let the dev server near the live install's state.
+for live in "$HOME/.t3" "${T3CODE_HOME:-}"; do
+  [ -n "$live" ] || continue
+  live=$(realpath -m -- "$live")
+  case "$home/" in
+    "$live"/*) die "--home $home is inside the live T3 state at $live" ;;
+  esac
+  case "$live/" in
+    "$home"/*) die "--home $home contains the live T3 state at $live" ;;
+  esac
+done
+
+log="$home/dev.log"
+sidfile="$home/dev.session"   # "<session id> <checkout>"
+
+ports() { # web and server ports the runner reported
+  local line
+  line=$(grep -m1 -o 'serverPort=[0-9]* webPort=[0-9]*' "$log" 2>/dev/null || true)
+  [ -n "$line" ] || return 1
+  echo "${line#*webPort=} $(echo "$line" | sed -E 's/serverPort=([0-9]+).*/\1/')"
+}
+
+pair_url() { grep -oE 'https?://[^[:space:]]+/pair#token=[^[:space:]"'"'"']+' "$log" 2>/dev/null | tail -1 || true; }
+
+# Processes in the recorded session that run from the recorded checkout. The
+# session id comes from setsid at start; children keep it after the runner
+# dies, and the checkout test guards against the id being reused.
+session_pids() {
+  [ -f "$sidfile" ] || return 0
+  local sid owner pid cwd
+  read -r sid owner < "$sidfile" || return 0
+  [[ "$sid" =~ ^[0-9]+$ ]] && [ "$sid" -gt 1 ] || return 0
+  [ "$owner" = "$checkout" ] || return 0
+  for pid in $(pgrep -s "$sid" || true); do
+    [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$(id -u)" ] || continue
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    case "$cwd/" in "$checkout"/*) echo "$pid" ;; esac
+  done
+}
+
+stop_session() {
+  local pids
+  pids=$(session_pids)
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    for _ in $(seq 1 10); do
+      [ -n "$(session_pids)" ] || break
+      sleep 0.5
+    done
+    pids=$(session_pids)
+    # shellcheck disable=SC2086
+    [ -z "$pids" ] || kill -9 $pids 2>/dev/null || true
+  fi
+  rm -f "$sidfile"
+}
+
+case "$cmd" in
+  start)
+    [ -f "$checkout/package.json" ] || die "no package.json in $checkout"
+    mkdir -p "$home"
+    exec 9>"$home/.lock"
+    flock -n 9 || die "another t3dev is using $home"
+    [ -z "$(session_pids)" ] || die "already running for $home; run 't3dev stop' first"
+    : > "$log"
+    (
+      cd "$checkout"
+      exec setsid env -u T3CODE_HOST -u T3CODE_PORT -u T3CODE_HOME -u T3CODE_DEV_AUTH_TOKEN \
+        -u T3_BOOT_SERVICE_UNIT -u T3_SERVICE_LAUNCHER_CONTEXT \
+        pnpm run dev --home-dir "$home" >>"$log" 2>&1 9>&-
+    ) &
+    leader=$!
+    # setsid runs in place (no fork) when its caller is not a group leader, as
+    # a background subshell is not, so the runner's pid is its session id.
+    for _ in $(seq 1 20); do
+      [ "$(ps -o sid= -p "$leader" 2>/dev/null | tr -d ' ')" = "$leader" ] && break
+      sleep 0.1
+    done
+    [ "$(ps -o sid= -p "$leader" 2>/dev/null | tr -d ' ')" = "$leader" ] \
+      || { kill "$leader" 2>/dev/null; die "could not start the runner in its own session"; }
+    echo "$leader $checkout" > "$sidfile"
+    ready=""
+    for _ in $(seq 1 90); do
+      if ! kill -0 "$leader" 2>/dev/null; then
+        echo "t3dev: the dev runner exited during startup; last lines of $log:" >&2
+        tail -20 "$log" >&2
+        stop_session
+        exit 1
+      fi
+      if read -r web server < <(ports) \
+        && curl -s -m 2 -o /dev/null "http://localhost:$web/" \
+        && curl -s -m 2 -o /dev/null "http://127.0.0.1:$server/" \
+        && [ -n "$(pair_url)" ]; then
+        ready=1
+        break
+      fi
+      sleep 2
+    done
+    if [ -z "$ready" ]; then
+      echo "t3dev: not ready after 180 s; last lines of $log:" >&2
+      tail -20 "$log" >&2
+      stop_session
+      exit 1
+    fi
+    echo "web:      http://localhost:$web/"
+    echo "server:   http://127.0.0.1:$server/"
+    echo "home:     $home"
+    echo "log:      $log"
+    echo "pair-url: $(pair_url)"
+    ;;
+  pair-url)
+    url=$(pair_url)
+    [ -n "$url" ] || die "no pairing URL in $log"
+    echo "$url"
+    ;;
+  status)
+    pids=$(session_pids)
+    if [ -z "$pids" ]; then echo "not running for $home"; exit 0; fi
+    # shellcheck disable=SC2086
+    ps -o pid=,etime=,args= -p "$(echo $pids | tr ' ' ',')"
+    if read -r web server < <(ports); then echo "web http://localhost:$web/  server http://127.0.0.1:$server/"; fi
+    ;;
+  stop)
+    stop_session
+    if read -r web server < <(ports) && ss -ltnH "( sport = :$web or sport = :$server )" | grep -q .; then
+      echo "t3dev: ports $web/$server are still in use by something this session did not start:" >&2
+      ss -ltnpH "( sport = :$web or sport = :$server )" >&2
+      exit 1
+    fi
+    echo "stopped"
+    if ! git -C "$checkout" diff --quiet -- apps/web/src/routeTree.gen.ts; then
+      echo "note: the dev server rewrote apps/web/src/routeTree.gen.ts; restore it before committing:"
+      echo "  git -C $checkout checkout -- apps/web/src/routeTree.gen.ts"
+    fi
+    ;;
+  *)
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac

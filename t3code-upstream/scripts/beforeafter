@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# beforeafter BEFORE.png AFTER.png OUT.png [BEFORE_LABEL] [AFTER_LABEL]
+# Stacks two screenshots of the same crop, labelled, for a PR's evidence.
+set -euo pipefail
+[ $# -ge 3 ] || { sed -n 2,3p "$0" | sed 's/^# //'; exit 2; }
+before="$1"; after="$2"; out="$3"
+label_before="${4:-before (main)}"; label_after="${5:-after}"
+magick \
+  \( "$before" -gravity NorthWest -fill red -pointsize 22 -annotate +10+8 "$label_before" \) \
+  \( "$after" -gravity NorthWest -fill green -pointsize 22 -annotate +10+8 "$label_after" \) \
+  -append "$out"
+echo "$out"
