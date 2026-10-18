@@ -56,8 +56,14 @@ spike CPU`. Drafts get triaged like ready PRs.
   rejects `useMemo`, `useCallback` and `"use memo"`. Write plain expressions;
   the compiler memoizes them. `apps/web/src/reactCompilerCoverage.test.ts`
   fails on any function the compiler skips: `try`/`finally`, `throw` inside
-  `try`, reading a ref during render, `setState` in an effect. Mobile is not
-  under this rule and still uses manual memoization.
+  `try`, reading a ref during render, `setState` in an effect.
+- **Mobile is converging on the same rule.** `apps/mobile/src/reactCompilerCoverage.test.ts`
+  compiles every file and keeps a `KNOWN_BAILOUTS` list that only shrinks.
+  Lint still allows `useMemo`/`useCallback` there (`allowMemoHooks`), but once
+  a file compiles, upstream drops its manual memoization; #21268 did this for
+  `ThreadFeed.tsx`. Write any new mobile code as plain functions. State that
+  must outlive renders goes in a ref that only handlers touch, not in a
+  `useMemo` cache.
 - **Large components** (`ChatView`, `ChatComposer`): handlers are plain
   functions, wrapped in `useStableCallback` only where they leave the
   component.
