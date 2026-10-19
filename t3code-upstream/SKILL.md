@@ -69,6 +69,9 @@ surrounding code, and the rules digest for React Compiler, comments and
 `components/ui`. Upstream lands hundreds of commits a day, and `ChatView.tsx`
 and `ChatMarkdown.tsx` churn constantly, so keep your footprint there small.
 Put logic in `packages/shared` and keep a thin wiring layer in web and mobile.
+A context the timeline's rows read is provided per row inside
+`MessagesTimeline`, next to `TimelineRowCtx`, never around the list: the
+comment there explains why, and #20861 first got this wrong.
 A change that affects both web and mobile needs both, or the PR has to say
 why one is out of scope.
 
@@ -184,7 +187,9 @@ a working link could silently move to another file.
   the delta. Reply on each thread with the commit SHA and what changed, and
   explain why when you take a different route. Dismiss false positives with a
   reason. Keep the PR body's numbers current (test counts, etc.).
-- If main moves under the PR, rebase onto fresh `origin/main`. In
+- Rebase onto fresh `origin/main` as soon as a wake reports a conflict, without
+  waiting for a maintainer: a maintainer who does look should find the PR
+  mergeable. In
   conflicted files that upstream has reworked, take theirs (`git checkout
   --ours` during a rebase) and re-apply your change by meaning, rather than
   merging hunk by hunk. Then rerun all of §3 and a quick live check.
@@ -208,6 +213,12 @@ a working link could silently move to another file.
 - Yair's install trails main. Before calling something a bug, check whether
   main has already fixed it: find the fixing commit and run
   `git tag --contains`.
+- Web's `pnpm test` includes a browser project that needs Playwright's
+  headless Chromium. If it fails with "Executable doesn't exist", run
+  `pnpm exec playwright install chromium-headless-shell` in `apps/web` (it
+  writes only to `~/.cache/ms-playwright`). Running `vp test run` from the
+  repo root runs browser suites without a browser, and they fail by the
+  hundred; use each package's `pnpm test`.
 - Personal data stays out of anything published: no real paths, thread
   contents or client names. Use made-up paths in the PR and fixtures in
   screenshots.
