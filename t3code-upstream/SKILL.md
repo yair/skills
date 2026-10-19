@@ -189,10 +189,14 @@ a working link could silently move to another file.
   reason. Keep the PR body's numbers current (test counts, etc.).
 - Rebase onto fresh `origin/main` as soon as a wake reports a conflict, without
   waiting for a maintainer: a maintainer who does look should find the PR
-  mergeable. In
-  conflicted files that upstream has reworked, take theirs (`git checkout
-  --ours` during a rebase) and re-apply your change by meaning, rather than
-  merging hunk by hunk. Then rerun all of §3 and a quick live check.
+  mergeable. In conflicted files that upstream has reworked, take theirs
+  (`git checkout --ours` during a rebase) and re-apply your change by meaning,
+  rather than merging hunk by hunk. Then rerun all of §3 and a quick live
+  check.
+- A maintainer may take the PR over and rebuild it on main themselves.
+  #20861 was taken over to be rebuilt as a stack, with credit. From then
+  on, stop rebasing and pushing. Check their plan against the PR's cases, and
+  say so if a case would be lost. Close the engine task when they close the PR.
 
 ## Gotchas
 
