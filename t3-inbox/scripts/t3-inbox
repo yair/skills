@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""Per-thread T3 webhook inboxes. Python stdlib only; SQLite is always read-only.
+
+URLs and the bearer are credentials. Only explicit CLI requests and hook context
+print URLs; diagnostics contain fixed reason codes, never exception contents.
+"""
+import argparse
+import base64
+from contextlib import closing, contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import socket
+import sqlite3
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+import uuid
+
+PROMPT = "Inbox message from {{body.from}}: {{body.subject}}\n{{body.text}}\n{{body.url}}\nReply to: {{body.reply_to}}"
+ENVELOPE_FIELDS = ("from", "subject", "text", "url", "reply_to")
+# Permanent identity contract: never change this namespace after deployment.
+NAMESPACE = uuid.UUID("7b1def85-152e-512f-a5d6-68a161433cd5")
+MAX_MESSAGE = 16 * 1024 * 1024
+TTL = "365d"  # CLI accepts durations without an explicit upper bound; renew yearly.
+
+
+class InboxError(Exception):
+    """Arguments must be fixed, credential-free reason codes."""
+
+
+def task_id(thread_id):
+    return str(uuid.uuid5(NAMESPACE, thread_id))
+
+
+def xdg(kind):
+    defaults = {"CONFIG": ".config", "CACHE": ".cache", "STATE": ".local/state"}
+    return Path(os.environ.get("XDG_" + kind + "_HOME") or Path.home() / defaults[kind]) / "t3-inbox"
+
+
+def private_dir(path):
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
+def private_write(path, data):
+    private_dir(path.parent)
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".inbox-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(data)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def db_path():
+    return Path(os.environ.get("T3CODE_HOME") or Path.home() / ".t3") / "userdata/statev2.sqlite"
+
+
+@contextmanager
+def database():
+    with closing(sqlite3.connect(db_path().absolute().as_uri() + "?mode=ro", uri=True,
+                                timeout=0.2)) as db:
+        db.row_factory = sqlite3.Row
+        yield db
+
+
+def thread_of(native_id):
+    with database() as db:
+        rows = db.execute("""
+            SELECT DISTINCT t.thread_id FROM orchestration_v2_projection_provider_threads p
+            JOIN orchestration_v2_projection_threads t ON t.thread_id=p.thread_id
+            WHERE p.driver IN ('claudeAgent','codex')
+              AND json_extract(p.payload_json,'$.nativeThreadRef.nativeId')=?
+              AND json_extract(p.payload_json,'$.nativeThreadRef.driver')=p.driver
+              AND t.deleted_at IS NULL AND t.archived_at IS NULL
+        """, (native_id,)).fetchall()
+    if len(rows) != 1:
+        raise InboxError("no-unique-session-mapping")
+    return rows[0][0]
+
+
+def thread_config(thread):
+    with database() as db:
+        row = db.execute("""SELECT payload_json FROM orchestration_v2_projection_threads
+            WHERE thread_id=? AND deleted_at IS NULL AND archived_at IS NULL""", (thread,)).fetchone()
+    if not row:
+        raise InboxError("thread-unavailable")
+    value = json.loads(row[0])
+    workspace = ({"type": "existing_worktree", "worktreePath": value["worktreePath"]}
+                 if value.get("worktreePath") else {"type": "root"})
+    if value.get("branch"):
+        workspace["branch"] = value["branch"]
+    return {"projectId": value["projectId"], "threadId": thread,
+            "modelSelection": value["modelSelection"], "runtimeMode": value["runtimeMode"],
+            "interactionMode": value["interactionMode"], "workspaceStrategy": workspace}
+
+
+def read_task(identifier):
+    with database() as db:
+        row = db.execute("SELECT * FROM scheduled_tasks WHERE task_id=?", (identifier,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["task_id"], "title": row["title"], "prompt": row["prompt"],
+            "enabled": bool(row["enabled"]), "schedule": json.loads(row["schedule_json"]),
+            "projectId": row["project_id"], "threadId": row["thread_id"],
+            "workspaceStrategy": json.loads(row["workspace_strategy_json"]),
+            "modelSelection": json.loads(row["model_selection_json"]),
+            "runtimeMode": row["runtime_mode"], "interactionMode": row["interaction_mode"],
+            "creationSource": row["creation_source"],
+            "webhook": {"path": "/api/hooks/" + identifier + "/" + row["webhook_token"]}
+            if row["webhook_token"] else None}
+
+
+def is_inbox(task):
+    return bool(task and task["threadId"] and task["title"] == "Inbox"
+                and task["id"] == task_id(task["threadId"])
+                and task["schedule"].get("type") == "webhook")
+
+
+def base_url(override=None):
+    if override:
+        base = override.rstrip("/")
+    else:
+        env = dict(os.environ)
+        if not (env.get("T3CODE_HOST") and env.get("T3CODE_PORT")):
+            result = subprocess.run(["systemctl", "--user", "show", "t3code.service",
+                                     "-p", "Environment", "--value"],
+                                    capture_output=True, text=True, timeout=1, check=True)
+            service = dict(item.split("=", 1) for item in shlex.split(result.stdout) if "=" in item)
+            for key in ("T3CODE_HOST", "T3CODE_PORT"):
+                env[key] = env.get(key) or service.get(key, "")
+        host, port = env.get("T3CODE_HOST"), env.get("T3CODE_PORT")
+        if not host or not port or host in ("0.0.0.0", "::"):
+            raise InboxError("backend-address-unavailable-use-base")
+        base = "http://" + ("[" + host + "]" if ":" in host else host) + ":" + port
+    parsed = urlsplit(base)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username
+            or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
+        raise InboxError("invalid-base-origin")
+    return base.rstrip("/")
+
+
+def bearer():
+    try:
+        token = (xdg("CONFIG") / "bearer").read_text().strip()
+    except FileNotFoundError:
+        raise InboxError("no-bearer-run-login") from None
+    if not token or any(c.isspace() for c in token):
+        raise InboxError("invalid-bearer")
+    return token
+
+
+def encode_frame(payload, opcode=1, fin=True):
+    """Client frames MUST be masked, including pong/close frames."""
+    if isinstance(payload, str):
+        payload = payload.encode()
+    size = len(payload)
+    head = bytes([(0x80 if fin else 0) | opcode])
+    if size < 126:
+        head += bytes([0x80 | size])
+    elif size < 65536:
+        head += bytes([0x80 | 126]) + struct.pack("!H", size)
+    else:
+        head += bytes([0x80 | 127]) + struct.pack("!Q", size)
+    mask = os.urandom(4)
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def decode_frame(read):
+    """Decode one unextended server frame using a read-exactly callback."""
+    first, second = read(2)
+    opcode, fin = first & 15, bool(first & 128)
+    if first & 0x70 or second & 128:
+        raise InboxError("invalid-server-frame")
+    size = second & 127
+    if size == 126:
+        size = struct.unpack("!H", read(2))[0]
+    elif size == 127:
+        size = struct.unpack("!Q", read(8))[0]
+    if size > MAX_MESSAGE or (opcode >= 8 and (not fin or size > 125)):
+        raise InboxError("invalid-frame-size")
+    return fin, opcode, read(size)
+
+
+class WebSocket:
+    def __init__(self, base, token, timeout=4):
+        self.base, self.token = base, token
+        self.deadline = time.monotonic() + timeout
+        self.buffer = bytearray()
+        self.sock = None
+
+    def remaining(self):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise InboxError("backend-timeout")
+        return left
+
+    def send(self, payload, opcode=1):
+        self.sock.settimeout(self.remaining())
+        self.sock.sendall(encode_frame(payload, opcode))
+
+    def read(self, size):
+        while len(self.buffer) < size:
+            self.sock.settimeout(self.remaining())
+            block = self.sock.recv(min(65536, size - len(self.buffer)))
+            if not block:
+                raise InboxError("backend-closed")
+            self.buffer.extend(block)
+        result = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return result
+
+    def __enter__(self):
+        parsed = urlsplit(self.base)
+        self.sock = socket.create_connection((parsed.hostname, parsed.port or
+                                               (443 if parsed.scheme == "https" else 80)),
+                                              timeout=self.remaining())
+        try:
+            if parsed.scheme == "https":
+                self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=parsed.hostname)
+            key = base64.b64encode(os.urandom(16)).decode()
+            request = ("GET /ws?orchestrationProtocol=2 HTTP/1.1\r\nHost: " + parsed.netloc +
+                       "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13" +
+                       "\r\nSec-WebSocket-Key: " + key + "\r\nAuthorization: Bearer " + self.token + "\r\n\r\n")
+            self.sock.settimeout(self.remaining())
+            self.sock.sendall(request.encode())
+            header = bytearray()
+            while not header.endswith(b"\r\n\r\n"):
+                header.extend(self.read(1))
+                if len(header) > 65536:
+                    raise InboxError("oversized-upgrade")
+            lines = header.decode("iso-8859-1").split("\r\n")
+            headers = {name.lower(): value.strip() for name, value in
+                       (line.split(":", 1) for line in lines[1:] if ":" in line)}
+            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            if (lines[0].split()[1] != "101" or headers.get("sec-websocket-accept", "") != accept
+                    or headers.get("upgrade", "").lower() != "websocket"
+                    or "upgrade" not in [part.strip().lower() for part in headers.get("connection", "").split(",")]):
+                raise InboxError("websocket-upgrade-rejected")
+            return self
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def __exit__(self, *args):
+        # Closing TCP ends this single exchange; no wait for a close handshake.
+        self.sock.close()
+
+    def receive(self):
+        parts, started, size = [], False, 0
+        while True:
+            fin, opcode, payload = decode_frame(self.read)
+            if opcode == 9:
+                self.send(payload, 10)
+                continue
+            if opcode == 10:
+                continue
+            if opcode == 8:
+                raise InboxError("websocket-closed")
+            if opcode not in (0, 1) or (opcode == 0) != started:
+                raise InboxError("invalid-text-fragment")
+            started = True
+            size += len(payload)
+            if size > MAX_MESSAGE:
+                raise InboxError("oversized-message")
+            parts.append(payload)
+            if fin:
+                return b"".join(parts).decode("utf-8")
+
+
+def rpc(base, token, method, payload):
+    with WebSocket(base, token) as ws:
+        ws.send(json.dumps({"_tag": "Request", "id": "1", "tag": method,
+                            "payload": payload, "headers": []}))
+        while True:
+            frame = json.loads(ws.receive())
+            for message in frame if isinstance(frame, list) else [frame]:
+                if message.get("_tag") == "Ping":
+                    ws.send(json.dumps({"_tag": "Pong"}))
+                if message.get("_tag") == "Exit" and str(message.get("requestId")) == "1":
+                    if message["exit"]["_tag"] != "Success":
+                        raise InboxError("rpc-failure")
+                    return message["exit"]["value"]
+
+
+@contextmanager
+def thread_lock(thread):
+    path = private_dir(xdg("CACHE")) / (task_id(thread) + ".lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        until = time.monotonic() + 4
+        while True:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= until:
+                    raise InboxError("inbox-lock-timeout")
+                time.sleep(0.02)
+        yield
+
+
+def inbox_url(base, task):
+    if not is_inbox(task) or not (task.get("webhook") or {}).get("path"):
+        raise InboxError("inbox-unavailable")
+    return base + task["webhook"]["path"]
+
+
+def open_inbox(thread, base, token):
+    with thread_lock(thread):
+        config = thread_config(thread)  # Always refresh, including on cached hook calls.
+        current = read_task(task_id(thread))
+        if current and not is_inbox(current):
+            raise InboxError("task-identity-collision")
+        if (not current or any(current[k] != v for k, v in config.items())
+                or current["prompt"] != PROMPT or not current["enabled"]
+                or current["creationSource"] != "mcp"):
+            current = rpc(base, token, "scheduledTasks.upsert", {
+                "id": task_id(thread), "title": "Inbox", "prompt": PROMPT,
+                "enabled": True, "schedule": {"type": "webhook"},
+                # agent/provider would mark deliveries as provider continuations,
+                # which Claude's adapter never sends to the model; MCP uses agent/mcp.
+                "createdBy": "agent", "creationSource": "mcp", **config})["task"]
+        result = {"threadId": thread, "taskId": task_id(thread),
+                  "url": inbox_url(base, current), "envelope": {key: "" for key in ENVELOPE_FIELDS}}
+        cache = xdg("CACHE") / (task_id(thread) + ".json")
+        serialized = json.dumps(result)
+        # Keep the per-thread cache in sync after checking live DB settings above.
+        if not cache.exists() or cache.read_text() != serialized:
+            private_write(cache, serialized)
+        return result
+
+
+def inboxes():
+    with database() as db:
+        ids = [r[0] for r in db.execute("SELECT task_id FROM scheduled_tasks WHERE title='Inbox'")]
+    return [task for identifier in ids if is_inbox(task := read_task(identifier))]
+
+
+def stale(thread):
+    with database() as db:
+        row = db.execute("""SELECT deleted_at, archived_at FROM orchestration_v2_projection_threads
+                            WHERE thread_id=?""", (thread,)).fetchone()
+    return row is None or row[0] is not None or row[1] is not None
+
+
+def log_hook(reason):
+    try:
+        path = private_dir(xdg("STATE")) / "hook.log"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(time.strftime("%Y-%m-%dT%H:%M:%S%z ") + reason + "\n")
+    except Exception:
+        pass
+
+
+def hook(override=None):
+    def timeout(*args):
+        raise InboxError("hook-timeout")
+    signal.signal(signal.SIGALRM, timeout)
+    signal.setitimer(signal.ITIMER_REAL, 5)
+    try:
+        if not (os.environ.get("T3CODE_HOST") and os.environ.get("T3CODE_PORT")):
+            raise InboxError("not-in-t3")
+        token = bearer()
+        payload = json.load(sys.stdin)
+        native = payload.get("session_id")
+        if not isinstance(native, str) or not native:
+            raise InboxError("no-session-id")
+        result = open_inbox(thread_of(native), base_url(override), token)
+        context = ("Your T3 inbox is live: " + result["url"] +
+                   " — POST JSON {from, subject, text, url, reply_to}; each POST becomes a turn in this thread. Don't auto-acknowledge inbox messages.")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                 "additionalContext": context}}))
+    except Exception as exc:
+        log_hook(str(exc) if isinstance(exc, InboxError) else type(exc).__name__)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    return 0
+
+
+def login(check, base):
+    if check:
+        rpc(base_url(base), bearer(), "scheduledTasks.list", {})
+        print("t3-inbox bearer is valid")
+        return
+    path = xdg("CONFIG") / "bearer"
+    if path.exists():
+        raise InboxError("bearer-exists-use-login-check-or-remove-to-renew")
+    command = ["npx", "-y", "t3@latest", "auth", "session", "issue",
+               "--scope", "orchestration:read", "--scope", "orchestration:operate",
+               "--label", "t3-inbox", "--ttl", TTL, "--json"]
+    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=120)
+    session = json.loads(result.stdout)
+    private_write(path, session["token"] + "\n")
+    metadata = {k: v for k, v in session.items() if k != "token"}
+    private_write(path.with_name("session.json"), json.dumps(metadata))
+    print(json.dumps(metadata))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", help="Backend HTTP(S) origin (overrides env/systemd)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("open", "url", "thread-of"):
+        child = sub.add_parser(name)
+        child.add_argument("identifier")
+        if name == "open":
+            child.add_argument("--json", action="store_true")
+    sub.add_parser("list")
+    sub.add_parser("hook")
+    sub.add_parser("login").add_argument("--check", action="store_true")
+    sub.add_parser("gc").add_argument("--dry-run", action="store_true")
+    # Accept --base both before and after the subcommand.
+    for child in sub.choices.values():
+        child.add_argument("--base", default=argparse.SUPPRESS, help="Backend HTTP(S) origin")
+    args = parser.parse_args()
+    if args.command == "hook":
+        return hook(args.base)
+    try:
+        if args.command == "login":
+            login(args.check, args.base)
+        elif args.command == "thread-of":
+            print(thread_of(args.identifier))
+        elif args.command == "open":
+            result = open_inbox(args.identifier, base_url(args.base), bearer())
+            print(json.dumps(result) if args.json else result["url"])
+        elif args.command == "url":
+            task = read_task(args.identifier) or read_task(task_id(args.identifier))
+            print(inbox_url(base_url(args.base), task))
+        elif args.command == "list":
+            base = base_url(args.base)
+            for task in inboxes():
+                with database() as db:
+                    row = db.execute("SELECT title FROM orchestration_v2_projection_threads WHERE thread_id=?",
+                                     (task["threadId"],)).fetchone()
+                print(json.dumps({"threadId": task["threadId"], "threadTitle": row[0] if row else None,
+                                  "taskId": task["id"], "url": inbox_url(base, task)}))
+        elif args.command == "gc":
+            for task in inboxes():
+                with thread_lock(task["threadId"]):
+                    if not stale(task["threadId"]) or not is_inbox(read_task(task["id"])):
+                        continue
+                    if not args.dry_run:
+                        rpc(base_url(args.base), bearer(), "scheduledTasks.delete", {"id": task["id"]})
+                        (xdg("CACHE") / (task["id"] + ".json")).unlink(missing_ok=True)
+                    print(("would-delete " if args.dry_run else "deleted ") + task["id"])
+    except Exception as exc:
+        print("t3-inbox: " + (str(exc) if isinstance(exc, InboxError) else type(exc).__name__), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

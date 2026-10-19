@@ -1,0 +1,352 @@
+"""Run from the skill directory: python3 -B -m unittest discover -s tests -v."""
+from concurrent.futures import ThreadPoolExecutor
+import base64
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import socket
+import sqlite3
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+import uuid
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/t3-inbox'
+loader = importlib.machinery.SourceFileLoader('inbox', str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+inbox = importlib.util.module_from_spec(spec)
+loader.exec_module(inbox)
+
+
+def server_frame(payload, opcode=1, fin=True):
+    if isinstance(payload, str):
+        payload = payload.encode()
+    size = len(payload)
+    head = bytes([(128 if fin else 0) | opcode])
+    if size < 126:
+        return head + bytes([size]) + payload
+    if size < 65536:
+        return head + b'\x7e' + struct.pack('!H', size) + payload
+    return head + b'\x7f' + struct.pack('!Q', size) + payload
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = dict(os.environ)
+        for key in list(self.env):
+            if key.startswith(('T3CODE_', 'XDG_')):
+                del self.env[key]
+        self.env.update(HOME=str(self.root), T3CODE_HOME=str(self.root / 't3'),
+                        XDG_CONFIG_HOME=str(self.root / 'config'),
+                        XDG_CACHE_HOME=str(self.root / 'cache'),
+                        XDG_STATE_HOME=str(self.root / 'state'))
+        path = self.root / 't3/userdata/statev2.sqlite'
+        path.parent.mkdir(parents=True)
+        self.db = sqlite3.connect(path)
+        self.db.executescript('''
+            CREATE TABLE orchestration_v2_projection_threads
+                (thread_id TEXT, project_id TEXT, title TEXT, payload_json TEXT,
+                 deleted_at TEXT, archived_at TEXT);
+            CREATE TABLE orchestration_v2_projection_provider_threads
+                (thread_id TEXT, driver TEXT, payload_json TEXT);
+            CREATE TABLE scheduled_tasks
+                (task_id TEXT, title TEXT, prompt TEXT, enabled INTEGER, schedule_json TEXT,
+                 project_id TEXT, thread_id TEXT, workspace_strategy_json TEXT,
+                 model_selection_json TEXT, runtime_mode TEXT, interaction_mode TEXT, webhook_token TEXT,
+                 creation_source TEXT);
+        ''')
+        self.thread = 'thread:child:example'
+        self.native = '01a1536d-6fed-7902-8f6c-ec547880b557'
+        self.config = {'projectId': 'project', 'modelSelection': {'instanceId': 'codex', 'model': 'test'},
+                       'runtimeMode': 'auto', 'interactionMode': 'default',
+                       'worktreePath': '/work/tree', 'branch': 'feature'}
+        self.db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?,?,NULL,NULL)',
+                        (self.thread, 'project', 'Build inbox', json.dumps(self.config)))
+        self.mapping('codex', self.native)
+        self.db.commit()
+        self.patcher = patch.dict(os.environ, self.env, clear=True)
+        self.patcher.start()
+
+    def mapping(self, driver, native, ref_driver=None):
+        value = {'nativeThreadRef': {'driver': ref_driver or driver, 'nativeId': native}}
+        self.db.execute('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?)',
+                        (self.thread, driver, json.dumps(value)))
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.db.close()
+        self.temp.cleanup()
+
+    def run_hook(self, env=None, payload=None):
+        result = subprocess.run(['python3', '-B', str(SCRIPT), 'hook'],
+                                input=json.dumps(payload or {'session_id': self.native,
+                                      'hook_event_name': 'UserPromptSubmit', 'prompt': 'test'}),
+                                capture_output=True, text=True, env=env or self.env, timeout=7)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, '')
+        return result.stdout
+
+    def with_bearer(self):
+        inbox.private_write(inbox.xdg('CONFIG') / 'bearer', 'test-bearer\n')
+
+    def add_task(self, **changes):
+        task = {'id': inbox.task_id(self.thread), 'title': 'Inbox', 'prompt': inbox.PROMPT,
+                'enabled': True, 'schedule': {'type': 'webhook'},
+                **inbox.thread_config(self.thread), 'creationSource': 'mcp',
+                'webhook': {'path': '/api/hooks/test/secret'}}
+        task.update(changes)
+        self.db.execute('INSERT INTO scheduled_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (task['id'], task['title'], task['prompt'], task['enabled'],
+                         json.dumps(task['schedule']), task['projectId'], task['threadId'],
+                         json.dumps(task['workspaceStrategy']), json.dumps(task['modelSelection']),
+                         task['runtimeMode'], task['interactionMode'], 'secret',
+                         task['creationSource']))
+        self.db.commit()
+        return task
+
+    def test_exact_lookup_both_drivers(self):
+        self.assertEqual(inbox.thread_of(self.native), self.thread)
+        self.mapping('claudeAgent', 'claude-native')
+        self.db.commit()
+        self.assertEqual(inbox.thread_of('claude-native'), self.thread)
+        with self.assertRaises(inbox.InboxError):
+            inbox.thread_of(self.native[:-1])
+
+    def test_lookup_excludes_wrong_driver_archived_deleted_and_ambiguous(self):
+        self.mapping('codex', 'wrong', 'claudeAgent')
+        self.db.commit()
+        with self.assertRaises(inbox.InboxError):
+            inbox.thread_of('wrong')
+        for column in ('archived_at', 'deleted_at'):
+            self.db.execute('UPDATE orchestration_v2_projection_threads SET '+column+'="now"')
+            self.db.commit()
+            with self.assertRaises(inbox.InboxError):
+                inbox.thread_of(self.native)
+            self.db.execute('UPDATE orchestration_v2_projection_threads SET '+column+'=NULL')
+        self.db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?, ?,NULL,NULL)',
+                        ('second', 'project', 'duplicate', json.dumps(self.config)))
+        self.db.execute('INSERT INTO orchestration_v2_projection_provider_threads SELECT ?,driver,payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id=?', ('second', self.thread))
+        self.db.commit()
+        with self.assertRaises(inbox.InboxError):
+            inbox.thread_of(self.native)
+
+    def test_sqlite_connection_is_read_only(self):
+        with inbox.database() as db:
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute('DELETE FROM scheduled_tasks')
+
+    def test_hook_no_t3_no_bearer_unknown_session(self):
+        self.assertEqual(self.run_hook(), '')
+        env = {**self.env, 'T3CODE_HOST': '127.0.0.1', 'T3CODE_PORT': '9'}
+        self.assertEqual(self.run_hook(env), '')
+        self.with_bearer()
+        self.assertEqual(self.run_hook(env, {'session_id': 'unknown'}), '')
+        log = (inbox.xdg('STATE') / 'hook.log').read_text()
+        self.assertIn('not-in-t3', log)
+        self.assertIn('no-bearer', log)
+        self.assertIn('no-unique-session-mapping', log)
+        self.assertNotIn('test-bearer', log)
+
+    def test_hook_backend_failure_and_bad_json(self):
+        self.with_bearer()
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0))
+            env = {**self.env, 'T3CODE_HOST': '127.0.0.1', 'T3CODE_PORT': str(server.getsockname()[1])}
+            self.assertEqual(self.run_hook(env), '')
+        result = subprocess.run(['python3', '-B', str(SCRIPT), 'hook'], input='{',
+                                capture_output=True, text=True, env=env, timeout=7)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
+
+    def test_hook_timeout_including_lock_wait(self):
+        self.with_bearer()
+        os.environ.update(T3CODE_HOST='127.0.0.1', T3CODE_PORT='9')
+        with inbox.thread_lock(self.thread):
+            start = time.monotonic()
+            self.assertEqual(self.run_hook(dict(os.environ)), '')
+            self.assertLess(time.monotonic() - start, 5.5)
+
+    def test_cached_hook_shape_and_one_line(self):
+        self.with_bearer()
+        self.add_task()
+        env = {**self.env, 'T3CODE_HOST': '127.0.0.1', 'T3CODE_PORT': '9'}
+        for extra in ({}, {'turn_id': 'codex-turn'}):
+            output = json.loads(self.run_hook(env, {'session_id': self.native, **extra}))['hookSpecificOutput']
+            self.assertEqual(output['hookEventName'], 'UserPromptSubmit')
+            context = output['additionalContext']
+            self.assertEqual(len(context.splitlines()), 1)
+            self.assertTrue(context.startswith('Your T3 inbox is live: http://127.0.0.1:9/api/hooks/'))
+            self.assertTrue(context.endswith("Don't auto-acknowledge inbox messages."))
+        cache = inbox.xdg('CACHE') / (inbox.task_id(self.thread) + '.json')
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_open_idempotence_and_model_runtime_interaction_drift(self):
+        current = self.add_task()
+        base = 'http://localhost:9'
+        with patch.object(inbox, 'rpc') as rpc:
+            first = inbox.open_inbox(self.thread, base, 'token')
+            self.assertEqual(first, inbox.open_inbox(self.thread, base, 'token'))
+            rpc.assert_not_called()
+        for key, value in [('modelSelection', {'instanceId': 'other', 'model': 'new'}),
+                           ('runtimeMode', 'full-access'), ('interactionMode', 'plan')]:
+            updated = {**self.config, key: value}
+            self.db.execute('UPDATE orchestration_v2_projection_threads SET payload_json=?', (json.dumps(updated),))
+            self.db.commit()
+            with patch.object(inbox, 'rpc', return_value={'task': current}) as rpc:
+                inbox.open_inbox(self.thread, base, 'token')
+                payload = rpc.call_args.args[3]
+                self.assertEqual(payload[key], value)
+                self.assertEqual(payload['id'], current['id'])
+
+    def test_open_repairs_provider_creation_source(self):
+        # agent/provider deliveries are provider continuations that Claude never sees.
+        current = self.add_task(creationSource='provider')
+        with patch.object(inbox, 'rpc', return_value={'task': current}) as rpc:
+            inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
+            payload = rpc.call_args.args[3]
+            self.assertEqual((payload['createdBy'], payload['creationSource']), ('agent', 'mcp'))
+
+    def test_concurrent_open_creates_once(self):
+        config = inbox.thread_config(self.thread)
+        saved = []
+        barrier = threading.Barrier(2)
+        def save(base, token, method, payload):
+            time.sleep(0.05)
+            saved.append({**payload, 'webhook': {'path': '/api/hooks/test/secret'}})
+            return {'task': saved[0]}
+        def open_one():
+            barrier.wait()
+            return inbox.open_inbox(self.thread, 'http://localhost', 'token')
+        with patch.object(inbox, 'thread_config', return_value=config), \
+             patch.object(inbox, 'read_task', side_effect=lambda _: saved[0] if saved else None), \
+             patch.object(inbox, 'rpc', side_effect=save) as rpc, ThreadPoolExecutor(2) as pool:
+            first, second = list(pool.map(lambda _: open_one(), range(2)))
+            self.assertEqual(first, second)
+            self.assertEqual(rpc.call_count, 1)
+
+    def test_gc_identity_and_archival(self):
+        task = self.add_task()
+        self.assertTrue(inbox.is_inbox(task))
+        self.assertFalse(inbox.is_inbox({**task, 'id': str(uuid.uuid4())}))
+        self.assertFalse(inbox.is_inbox({**task, 'title': 'Other'}))
+        self.assertFalse(inbox.stale(self.thread))
+        self.db.execute('UPDATE orchestration_v2_projection_threads SET archived_at="now"')
+        self.db.commit()
+        self.assertTrue(inbox.stale(self.thread))
+        self.assertTrue(inbox.stale('missing'))
+        result = subprocess.run(['python3', '-B', str(SCRIPT), 'gc', '--dry-run'],
+                                capture_output=True, text=True, env=self.env)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), 'would-delete '+task['id'])
+        self.assertIsNotNone(inbox.read_task(task['id']))
+
+    def test_systemctl_fallback_and_explicit_override(self):
+        output = subprocess.CompletedProcess([], 0, 'T3CODE_HOST=100.64.0.2 T3CODE_PORT=3773 OTHER="has spaces"')
+        with patch.object(inbox.subprocess, 'run', return_value=output) as run:
+            self.assertEqual(inbox.base_url(), 'http://100.64.0.2:3773')
+            self.assertEqual(inbox.base_url('https://example.com/'), 'https://example.com')
+            self.assertEqual(run.call_count, 1)
+
+
+class Protocol(unittest.TestCase):
+    def test_template_envelope_and_stable_identity(self):
+        self.assertEqual(inbox.PROMPT, 'Inbox message from {{body.from}}: {{body.subject}}\n{{body.text}}\n{{body.url}}\nReply to: {{body.reply_to}}')
+        self.assertEqual(inbox.ENVELOPE_FIELDS, ('from', 'subject', 'text', 'url', 'reply_to'))
+        self.assertEqual(inbox.task_id('thread:child:example'), str(uuid.uuid5(uuid.UUID('7b1def85-152e-512f-a5d6-68a161433cd5'), 'thread:child:example')))
+        self.assertNotEqual(inbox.task_id('a'), inbox.task_id('b'))
+
+    def test_client_masking_and_lengths(self):
+        for size in (0, 5, 125, 126, 65535, 65536):
+            data = b'x' * size
+            frame = inbox.encode_frame(data)
+            self.assertEqual(frame[0], 129)
+            self.assertTrue(frame[1] & 128)
+            length = frame[1] & 127
+            offset = 2
+            if length == 126:
+                length = struct.unpack('!H', frame[2:4])[0]
+                offset = 4
+            elif length == 127:
+                length = struct.unpack('!Q', frame[2:10])[0]
+                offset = 10
+            self.assertEqual(length, size)
+            mask = frame[offset:offset+4]
+            self.assertEqual(bytes(b ^ mask[i % 4] for i, b in enumerate(frame[offset+4:])), data)
+
+    def test_server_decoding_lengths(self):
+        for size in (0, 125, 126, 65535, 65536):
+            self.assertEqual(inbox.decode_frame(io.BytesIO(server_frame(b'x'*size)).read), (True, 1, b'x'*size))
+
+    def test_fragmented_utf8_with_interleaved_ping(self):
+        data = 'hello — inbox'.encode()
+        stream = io.BytesIO(server_frame(data[:7], fin=False) + server_frame(b'ping', opcode=9)
+                            + server_frame(b'', opcode=10) + server_frame(data[7:], opcode=0))
+        ws = inbox.WebSocket('http://localhost', 'token')
+        ws.read = stream.read
+        with patch.object(ws, 'send') as send:
+            self.assertEqual(ws.receive(), 'hello — inbox')
+            send.assert_called_once_with(b'ping', 10)
+
+    def test_upgrade_and_rpc_on_real_socket(self):
+        errors = []
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0))
+            server.listen()
+            server.settimeout(2)
+            def serve():
+                try:
+                    with server.accept()[0] as connection:
+                        connection.settimeout(2)
+                        request = bytearray()
+                        while not request.endswith(b'\r\n\r\n'):
+                            request.extend(connection.recv(1))
+                        self.assertIn(b'Authorization: Bearer test-token', request)
+                        key = next(line.split(b':', 1)[1].strip() for line in request.split(b'\r\n')
+                                   if line.lower().startswith(b'sec-websocket-key:'))
+                        accept = base64.b64encode(hashlib.sha1(key + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+                        connection.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: WebSocket\r\n'
+                                           b'Connection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: '+accept+b'\r\n\r\n')
+                        self.assertTrue(connection.recv(4096)[1] & 128)
+                        response = json.dumps([{'_tag': 'Ping'}, {'_tag': 'Exit', 'requestId': '1',
+                                               'exit': {'_tag': 'Success', 'value': {'tasks': []}}}]).encode()
+                        connection.sendall(server_frame(response[:10], fin=False) +
+                                           server_frame(b'alive', opcode=9) + server_frame(response[10:], opcode=0))
+                        connection.recv(4096)
+                except Exception as exc:
+                    errors.append(exc)
+            worker = threading.Thread(target=serve)
+            worker.start()
+            try:
+                result = inbox.rpc('http://127.0.0.1:'+str(server.getsockname()[1]),
+                                   'test-token', 'scheduledTasks.list', {})
+                self.assertEqual(result, {'tasks': []})
+            finally:
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            if errors:
+                raise errors[0]
+
+    def test_invalid_frames_and_fragments(self):
+        for frame in (b'\xc1\0', b'\x81\x80', b'\x09\0', b'\x89\x7e\0\x7e'):
+            with self.assertRaises(inbox.InboxError):
+                inbox.decode_frame(io.BytesIO(frame).read)
+        for frame in (server_frame(b'x', opcode=0), server_frame(b'x', opcode=2),
+                      server_frame(b'x', fin=False) + server_frame(b'y')):
+            ws = inbox.WebSocket('http://localhost', 'token')
+            ws.read = io.BytesIO(frame).read
+            with self.assertRaises(inbox.InboxError):
+                ws.receive()
+
+
+if __name__ == '__main__':
+    unittest.main()
