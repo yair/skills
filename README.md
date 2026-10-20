@@ -22,6 +22,8 @@ skills/
 
 **Key principle:** Scripts handle deterministic work. SKILL.md handles reasoning. Don't use a skill where a script suffices. Don't use a script where reasoning is required.
 
+Agents changing this repository: read [AGENTS.md](AGENTS.md) first. Changes are reviewed before Yair pushes them.
+
 ## Skills
 
 | Skill | Description | Status |

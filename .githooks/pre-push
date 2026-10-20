@@ -1,0 +1,6 @@
+#!/bin/sh
+# Only Yair pushes, after the change has landed through an engine review. See
+# AGENTS.md at the repo root. A speed bump for agent sessions only.
+[ -n "${CLAUDECODE:-}${CODEX_THREAD_ID:-}${CODEX_CI:-}" ] || exit 0
+echo "Refusing a push from an agent session: Yair pushes once the engine review has landed. See AGENTS.md at the root of this repository." >&2
+exit 1

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Agents commit on a branch in a worktree, never on main: every home applies
+# its local main as it stands, pushed or not. See AGENTS.md at the repo root.
+# A speed bump for agent sessions only; people commit as they like.
+[ -n "${CLAUDECODE:-}${CODEX_THREAD_ID:-}${CODEX_CI:-}" ] || exit 0
+[ "$(git symbolic-ref --short -q HEAD)" = main ] || exit 0
+echo "Refusing an agent commit on main. Commit on a branch in a worktree; see AGENTS.md at the root of this repository." >&2
+exit 1
