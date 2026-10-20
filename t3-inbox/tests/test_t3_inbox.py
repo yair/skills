@@ -258,6 +258,48 @@ class Fixture(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
 
 
+    def runtime(self, version='9.9.9', state=None):
+        runtime = self.root / 't3/runtime'
+        binary = runtime / 'versions' / version / 't3'
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/argv"\n'
+                          'echo \'{"token": "issued-token", "id": "s1", "label": "t3-inbox"}\'\n')
+        binary.chmod(0o755)
+        (runtime / 'service-state.json').write_text(json.dumps(state or {'protocol': 3, 'activeVersion': version}))
+        return binary
+
+    def test_login_runs_the_backends_own_t3(self):
+        binary = self.runtime()
+        npx = self.root / 'bin/npx'
+        npx.parent.mkdir()
+        npx.write_text('#!/bin/sh\ntouch "$0.ran"\nexit 1\n')
+        npx.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': f"{npx.parent}:{os.environ['PATH']}"}), \
+                patch('sys.stdout', new_callable=io.StringIO) as out:
+            inbox.login(False, None)
+        argv = (binary.parent / 'argv').read_text().split()
+        self.assertEqual(argv[:3], ['auth', 'session', 'issue'])
+        self.assertIn('orchestration:operate', argv)
+        self.assertFalse(Path(str(npx) + '.ran').exists())
+        self.assertEqual((inbox.xdg('CONFIG') / 'bearer').read_text(), 'issued-token\n')
+        self.assertNotIn('issued-token', out.getvalue())
+
+    def test_login_refuses_a_missing_or_odd_runtime(self):
+        for state in (None, {'activeVersion': '../../bin'}, {'activeVersion': ''}, {'protocol': 3}):
+            with self.subTest(state=state):
+                runtime = self.root / 't3/runtime'
+                if state is None:
+                    (runtime / 'service-state.json').unlink(missing_ok=True)
+                else:
+                    runtime.mkdir(parents=True, exist_ok=True)
+                    (runtime / 'service-state.json').write_text(json.dumps(state))
+                with self.assertRaisesRegex(inbox.InboxError, '^t3-runtime-unavailable$'):
+                    inbox.login(False, None)
+        self.runtime(version='1.0.0', state={'activeVersion': '2.0.0'})
+        with self.assertRaisesRegex(inbox.InboxError, '^t3-runtime-unavailable$'):
+            inbox.login(False, None)
+
+
 class Protocol(unittest.TestCase):
     def test_template_envelope_and_stable_identity(self):
         self.assertEqual(inbox.PROMPT, 'Inbox message from {{body.from}}: {{body.subject}}\n{{body.text}}\n{{body.url}}\nReply to: {{body.reply_to}}')

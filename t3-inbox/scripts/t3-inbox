@@ -64,8 +64,30 @@ def private_write(path, data):
             os.unlink(temp)
 
 
+def t3_home():
+    return Path(os.environ.get("T3CODE_HOME") or Path.home() / ".t3")
+
+
 def db_path():
-    return Path(os.environ.get("T3CODE_HOME") or Path.home() / ".t3") / "userdata/statev2.sqlite"
+    return t3_home() / "userdata/statev2.sqlite"
+
+
+def t3_binary():
+    """The t3 this user's backend runs: activeVersion in t3's own service state,
+    which the service launcher and `t3 update` keep current. Not npx, which runs
+    whatever npm calls latest, may differ from the backend, and fetches code."""
+    runtime = t3_home() / "runtime"
+    try:
+        version = json.loads((runtime / "service-state.json").read_text())["activeVersion"]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise InboxError("t3-runtime-unavailable") from None
+    if (not isinstance(version, str) or version in ("", ".", "..")
+            or not all(c.isalnum() or c in "._-+" for c in version)):
+        raise InboxError("t3-runtime-unavailable")
+    binary = runtime / "versions" / version / "t3"
+    if not os.access(binary, os.X_OK):
+        raise InboxError("t3-runtime-unavailable")
+    return str(binary)
 
 
 @contextmanager
@@ -399,7 +421,7 @@ def login(check, base):
     path = xdg("CONFIG") / "bearer"
     if path.exists():
         raise InboxError("bearer-exists-use-login-check-or-remove-to-renew")
-    command = ["npx", "-y", "t3@latest", "auth", "session", "issue",
+    command = [t3_binary(), "auth", "session", "issue",
                "--scope", "orchestration:read", "--scope", "orchestration:operate",
                "--label", "t3-inbox", "--ttl", TTL, "--json"]
     result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=120)
