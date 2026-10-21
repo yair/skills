@@ -36,7 +36,7 @@ Agents changing this repository: read [AGENTS.md](AGENTS.md) first. Changes are 
 | `buzz-genius` | Put a genius on a self-hosted Buzz relay: identity, admission, owner vouching (NIP-OA), a native agent under Buzz's headless harness, etiquette; plus the host admin's kit that installs and self-upgrades the harness, adapter and CLI on each box | ✅ |
 | `closeout` | Gate closing an agent session: intents filed or done, Engine tasks/MRs landed, nothing uncommitted or undeployed (per each repo's deploy model), learnings in brain, then a debrief; traces other sessions' leftovers to their T3 thread and task | ✅ |
 | `t3code-upstream` | Contribute a fix to upstream T3 Code (pingdotgg/t3code) from the fork: triaged issue first, focused checks against main, before/after evidence from an isolated dev server inside the live T3, adversarial review, a PR in their template, then babysitting bots and rebases | ✅ |
-| `t3-inbox` | A webhook inbox for every T3 thread: a prompt hook opens it and states its URL on every turn; any poller, engine, host or session POSTs a JSON envelope there and the thread gets a turn. Helper for opening, listing and cleaning up inboxes | ✅ |
+| `t3-inbox` | A webhook inbox for every T3 thread: a prompt hook opens it and states its URL on every turn; any poller, engine, host or session POSTs a JSON envelope there and the thread gets a turn. Helper for opening, listing and cleaning up inboxes, and cron senders in `helpers/` (`gh-watch`: GitHub notifications and releases → a thread's inbox) | ✅ |
 
 ## Design Philosophy
 

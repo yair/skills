@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""gh-watch: post new GitHub activity to a T3 thread's inbox. Python stdlib only.
+
+Each run reads the account's GitHub notifications (read-only: it never marks them
+read) and, optionally, the stable releases of named repositories. It keeps what
+matches --repo or --issue, drops what it has already sent, and posts one envelope
+for everything new to the thread's inbox. No LLM runs unless something happened.
+
+The inbox URL is looked up with this skill's `t3-inbox url` at send time and never
+stored or printed; the GitHub token is sent only to --api. Diagnostics name a
+reason, never a URL or a token. State advances only after the inbox answers 2xx.
+"""
+import argparse
+from datetime import datetime, timedelta, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+OVERLAP = timedelta(minutes=10)   # re-read before the last poll, for late-indexed notifications
+SEEN_KEEP = 2000
+INBOX = Path(__file__).resolve().parents[1] / "scripts/t3-inbox"
+ISSUE = re.compile(r"^([\w.-]+/[\w.-]+)#(\d+)$")
+SUBJECT = re.compile(r"/repos/([^/]+/[^/]+)/(issues|pulls)/(\d+)$")
+
+
+class WatchError(Exception):
+    """Arguments are fixed reason texts, never URLs or tokens."""
+
+
+def log(message):
+    print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}", flush=True)
+
+
+def iso(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text):
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def token(token_file):
+    value = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not value and token_file:
+        try:
+            value = Path(token_file).expanduser().read_text().strip()
+        except OSError:
+            raise WatchError("token file unreadable")
+    if not value:
+        try:
+            value = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True,
+                                   timeout=30).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            value = ""
+    if not value:
+        raise WatchError("no GitHub token: set GH_TOKEN, pass --token-file, or log in with gh")
+    return value
+
+
+class GitHub:
+    def __init__(self, api, secret):
+        self.api = api.rstrip("/")
+        self.origin = urllib.parse.urlsplit(self.api)[:2]
+        self.secret = secret
+
+    def get(self, url, what):
+        """GET a JSON document; the token goes only to the --api origin. Returns (body, next URL)."""
+        if not url.startswith(("http://", "https://")):
+            url = self.api + "/" + url.lstrip("/")
+        if urllib.parse.urlsplit(url)[:2] != self.origin:
+            raise WatchError(f"{what}: refusing a URL outside --api")
+        request = urllib.request.Request(url, headers={
+            "Authorization": "Bearer " + self.secret, "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "t3-inbox-gh-watch"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = json.load(response)
+                link = response.headers.get("Link") or ""
+        except urllib.error.HTTPError as error:
+            raise WatchError(f"{what}: GitHub answered HTTP {error.code}")
+        except (urllib.error.URLError, OSError, ValueError):
+            raise WatchError(f"{what}: GitHub unreachable or answered garbage")
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        return body, (match.group(1) if match else None)
+
+    def pages(self, url, what):
+        out = []
+        while url:
+            body, url = self.get(url, what)
+            if not isinstance(body, list):
+                raise WatchError(f"{what}: GitHub answered an unexpected shape")
+            out.extend(body)
+        return out
+
+
+def notifications(github, since, repo_re, issues, skip_reasons):
+    query = urllib.parse.urlencode({"all": "true", "participating": "false", "per_page": 50,
+                                    "since": iso(since)})
+    items = []
+    for n in github.pages("notifications?" + query, "notifications"):
+        repo = n["repository"]["full_name"]
+        match = SUBJECT.search((n.get("subject") or {}).get("url") or "")
+        number = int(match.group(3)) if match else None
+        if n.get("reason") in skip_reasons:
+            continue
+        if not ((repo_re and repo_re.search(repo)) or (repo, number) in issues):
+            continue
+        web = (f"https://github.com/{repo}/{'pull' if match.group(2) == 'pulls' else 'issues'}/{number}"
+               if match else f"https://github.com/{repo}")
+        items.append({"key": f"{n['id']}|{n['updated_at']}", "repo": repo,
+                      "type": n["subject"].get("type"), "number": number,
+                      "title": (n["subject"].get("title") or "")[:200], "reason": n.get("reason"),
+                      "updated_at": n["updated_at"], "url": web,
+                      "comment": n["subject"].get("latest_comment_url")})
+    return sorted(items, key=lambda item: item["updated_at"])
+
+
+def releases(github, repo):
+    body, _ = github.get(f"repos/{repo}/releases?per_page=10", f"releases of {repo}")
+    if not isinstance(body, list):
+        raise WatchError(f"releases of {repo}: GitHub answered an unexpected shape")
+    return [{"key": f"rel|{repo}|{r['tag_name']}", "repo": repo, "type": "Release", "number": None,
+             "title": r["tag_name"], "reason": "release", "updated_at": r.get("published_at"),
+             "url": r.get("html_url"), "comment": None}
+            for r in reversed(body) if not (r.get("prerelease") or r.get("draft"))]
+
+
+def actor(github, item):
+    if not item["comment"]:
+        return None
+    try:
+        body, _ = github.get(item["comment"], "latest comment")
+        return (body.get("user") or {}).get("login")
+    except WatchError:
+        return None   # a foreign or failing comment URL only costs the name
+
+
+def envelope(items, pending, sender, note):
+    def line(it):
+        if it["type"] == "Release":
+            return f"- {it['repo']} released {it['title']} — {it['url']}"
+        by = f", last comment by {it['actor']}" if it.get("actor") else ""
+        return f"- {it['repo']}#{it['number'] or '-'} [{it['reason']}{by}] {it['title']} — {it['url']}"
+    subject = f"{len(items)} GitHub update(s)"
+    if pending > len(items):
+        subject += f" ({pending} pending, the rest next run)"
+    text = "\n".join(line(it) for it in items) + (f"\n\n{note}" if note else "")
+    message = {"from": sender, "subject": subject, "text": text}
+    if len(items) == 1:
+        message["url"] = items[0]["url"]
+    return message
+
+
+def inbox_url(command, thread, base):
+    argv = [*command, "url", thread] + (["--base", base] if base else [])
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise WatchError("inbox lookup failed to run")
+    url = result.stdout.strip()
+    if result.returncode or not url.startswith(("http://", "https://")):
+        reason = (result.stderr.strip().splitlines() or ["no output"])[-1][:120]
+        raise WatchError("inbox lookup failed: " + re.sub(r"https?://\S+", "<url>", reason))
+    return url
+
+
+def deliver(url, message):
+    request = urllib.request.Request(url, data=json.dumps(message).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            code = response.status
+    except urllib.error.HTTPError as error:
+        code = error.code
+    except (urllib.error.URLError, OSError):
+        raise WatchError("delivery failed: inbox unreachable")
+    if not 200 <= code < 300:
+        raise WatchError(f"delivery failed: inbox answered HTTP {code}")
+
+
+def run(args):
+    if not (args.repo or args.issue or args.release_repo):
+        raise WatchError("nothing to watch: give --repo, --issue or --release-repo")
+    issues = set()
+    for spec in args.issue:
+        match = ISSUE.match(spec)
+        if not match:
+            raise WatchError(f"--issue wants owner/repo#N, got {spec!r}")
+        issues.add((match.group(1), int(match.group(2))))
+    repo_re = re.compile(args.repo) if args.repo else None
+    state = Path(args.state_dir).expanduser() if args.state_dir else (
+        Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+        / "t3-inbox/gh-watch" / args.thread)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.chmod(0o700)
+    lock = open(state / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another gh-watch run holds this state; skipping")
+        return 0
+    github = GitHub(args.api, token(args.token_file))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    since_file, seen_file = state / "since", state / "seen"
+
+    if not since_file.exists():
+        keys = [r["key"] for repo in args.release_repo for r in releases(github, repo)]
+        if not args.dry_run:
+            seen_file.write_text("".join(k + "\n" for k in keys))
+            since_file.write_text(iso(now) + "\n")
+        log(f"seeded: following activity from {iso(now)}" + (" (dry run, nothing written)" if args.dry_run else ""))
+        return 0
+    try:
+        since = parse_iso(since_file.read_text().strip())
+    except ValueError:
+        raise WatchError("state file 'since' is unreadable")
+    seen = set(seen_file.read_text().split("\n")) if seen_file.exists() else set()
+
+    found = notifications(github, since - OVERLAP, repo_re, issues, set(args.skip_reason))
+    for repo in args.release_repo:
+        found.extend(releases(github, repo))
+    new = [item for item in found if item["key"] not in seen]
+    if not new:
+        if not args.dry_run:
+            since_file.write_text(iso(now) + "\n")
+        log("no new activity")
+        return 0
+    batch = new[:args.max_items]
+    for item in batch:
+        item["actor"] = actor(github, item)
+    message = envelope(batch, len(new), args.sender, args.note)
+    summary = ", ".join(f"{it['repo']} {it['title']}" if it["type"] == "Release"
+                        else f"{it['repo']}#{it['number'] or '-'} {it['reason']}" for it in batch)
+    if args.dry_run:
+        print(json.dumps(message, indent=2, ensure_ascii=False))
+        log(f"dry run: would deliver {len(batch)} of {len(new)} item(s): {summary}")
+        return 0
+    try:
+        deliver(inbox_url(args.inbox_cmd, args.thread, args.base), message)
+    except WatchError as error:
+        log(f"{error}; {len(new)} item(s) stay pending: {summary}")
+        return 1
+    kept = [k for k in seen_file.read_text().split("\n") if k] if seen_file.exists() else []
+    kept = (kept + [item["key"] for item in batch])[-SEEN_KEEP:]
+    seen_file.write_text("".join(k + "\n" for k in kept))
+    if len(new) <= args.max_items:
+        since_file.write_text(iso(now) + "\n")
+    log(f"delivered {len(batch)} of {len(new)} item(s): {summary}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="gh-watch", description=__doc__.split("\n")[0])
+    parser.add_argument("--thread", required=True, help="T3 thread id whose inbox gets the messages")
+    parser.add_argument("--repo", help="regex on owner/repo: every notification from matching repos")
+    parser.add_argument("--issue", action="append", default=[], metavar="OWNER/REPO#N",
+                        help="a single issue or PR to follow (repeatable)")
+    parser.add_argument("--release-repo", action="append", default=[], metavar="OWNER/REPO",
+                        help="also report new stable releases of this repo (repeatable)")
+    parser.add_argument("--skip-reason", action="append", default=None, metavar="REASON",
+                        help="notification reasons to drop (repeatable; default ci_activity)")
+    parser.add_argument("--from", dest="sender",
+                        default=f"gh-watch ({os.environ.get('USER', '?')}@{socket.gethostname()})")
+    parser.add_argument("--note", help="a line appended to every message, e.g. where context lives")
+    parser.add_argument("--max-items", type=int, default=20, help="items per message; the rest next run")
+    parser.add_argument("--state-dir", help="default $XDG_STATE_HOME/t3-inbox/gh-watch/<thread>")
+    parser.add_argument("--token-file", help="file holding a GitHub token (else GH_TOKEN, else gh)")
+    parser.add_argument("--base", help="T3 backend origin for `t3-inbox url` (needed under cron)")
+    parser.add_argument("--api", default="https://api.github.com", help=argparse.SUPPRESS)
+    parser.add_argument("--inbox-cmd", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", action="store_true", help="print the message; send and record nothing")
+    args = parser.parse_args(argv)
+    args.skip_reason = ["ci_activity"] if args.skip_reason is None else args.skip_reason
+    args.inbox_cmd = args.inbox_cmd.split() if args.inbox_cmd else [sys.executable, str(INBOX)]
+    try:
+        return run(args)
+    except WatchError as error:
+        log(str(error))
+    except (KeyError, TypeError, AttributeError):
+        log("GitHub answered an unexpected shape")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

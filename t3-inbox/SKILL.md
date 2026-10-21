@@ -1,6 +1,6 @@
 ---
 name: t3-inbox
-description: Every T3 Code thread has an inbox, a webhook URL where any sender can POST a JSON message that becomes a turn in that thread. Use when sending a message to another T3 session or to yourself later, handing your inbox URL to Yair, a poller, the engine or another host, opening an inbox for a thread programmatically, finding a thread's inbox, cleaning up inboxes of deleted threads, or when the "Your T3 inbox is live" line is missing. Triggers include "inbox", "notify that session", "send this to the other thread", "webhook URL for this session", "ping me when", "t3-inbox".
+description: Every T3 Code thread has an inbox, a webhook URL where any sender can POST a JSON message that becomes a turn in that thread. Use when sending a message to another T3 session or to yourself later, handing your inbox URL to Yair, a poller, the engine or another host, opening an inbox for a thread programmatically, finding a thread's inbox, cleaning up inboxes of deleted threads, setting up a cron sender such as `helpers/gh-watch` (wake a thread on GitHub issue, PR or release activity), or when the "Your T3 inbox is live" line is missing. Triggers include "inbox", "notify that session", "send this to the other thread", "webhook URL for this session", "ping me when", "watch this issue", "wake me on GitHub comments", "t3-inbox".
 ---
 
 # t3-inbox — a webhook inbox for every T3 thread
@@ -124,6 +124,56 @@ The hook never blocks a prompt. On failure it logs one reason code to
 The hook does nothing when this skill isn't linked into `~/.claude/skills` or
 `~/.codex/skills`.
 
+## Helpers: senders you can run from cron
+
+`helpers/` holds ready-made senders. Each one turns an outside event source into
+inbox messages for one thread, and every helper keeps these rules:
+
+- **It looks the URL up at send time** with this skill's `t3-inbox url`, so a
+  rotated URL works at once. It never stores, prints or logs the URL, or any
+  other credential it uses.
+- **It sends one message per run** however much happened, and nothing when
+  nothing happened.
+- **It records what it sent only after the inbox answers 2xx.** A failed run
+  leaves everything pending for the next one.
+- **It runs under cron:** pass `--base`, because cron has no user bus to find
+  the backend. It takes its own lock, so overlapping runs skip.
+- **It has tests** in `tests/`, hermetic like the rest.
+
+### `gh-watch`: GitHub notifications
+
+Posts new activity from the account's GitHub notifications, and optionally
+new stable releases, to a thread's inbox. It reads notifications without
+marking them read. GitHub's own subscriptions are the follow list: anything
+the account filed, commented on or subscribed to.
+
+| Option | Meaning |
+|---|---|
+| `--thread ID` | The thread whose inbox gets the messages. Required. |
+| `--repo REGEX` | Every notification from repos matching `owner/repo`. |
+| `--issue OWNER/REPO#N` | One issue or PR, repeatable. Use it with `--repo` or alone. |
+| `--release-repo OWNER/REPO` | Also report new stable releases, repeatable. |
+| `--skip-reason R` | Notification reasons to drop, repeatable. Default: `ci_activity`. |
+| `--from`, `--note` | The envelope's sender, and a line added to every message (say where the context lives). |
+| `--token-file F` | A GitHub token with `notifications` (or `repo`) scope. Otherwise `GH_TOKEN`, otherwise `gh auth token`. |
+| `--base URL` | The T3 backend, for `t3-inbox url`. |
+| `--dry-run` | Print the message. Send and record nothing. |
+
+The first run only records a starting point and sends nothing. Each later
+run re-reads from ten minutes before the previous one, drops what it already
+sent (an update to a thread counts as new), and sends at most `--max-items`
+(default 20); the rest go next run. State lives in
+`~/.local/state/t3-inbox/gh-watch/<thread>/`. Each message lists one line per
+item: repo, number, reason, the last commenter's login, title and link.
+
+```cron
+*/15 * * * * timeout 120 ~/.claude/skills/t3-inbox/helpers/gh-watch --thread <threadId> --repo '^owner/repo$' --base http://HOST:PORT --note 'Context: <where>' >> ~/.local/state/t3-inbox/gh-watch.log 2>&1
+```
+
+Every 15 minutes is enough: GitHub asks clients not to poll notifications
+more often than its `X-Poll-Interval`, normally 60 s. Check what a watcher
+would send with `--dry-run` once it has seeded.
+
 ## Invariants (for whoever edits `scripts/t3-inbox`)
 
 - **`statev2.sqlite` is read-only, always.** Every write goes through the
@@ -135,4 +185,4 @@ The hook does nothing when this skill isn't linked into `~/.claude/skills` or
 - **The URL and bearer never appear in diagnostics.** Errors are fixed reason
   codes.
 - **Tests:** run `python3 -B -m unittest discover -s tests -v` from this
-  directory.
+  directory. They cover the helpers too.
