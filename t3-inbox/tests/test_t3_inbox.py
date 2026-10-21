@@ -252,7 +252,20 @@ class Fixture(unittest.TestCase):
                     else:
                         inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
                     rpc.assert_not_called()
+        # A private database doesn't help when transcripts sit behind searchable directories.
+        sessions = self.root / '.codex/sessions/2026'
+        sessions.mkdir(parents=True)
+        (sessions / 'rollout.jsonl').write_text('{}')
+        for directory in (self.root / '.codex', self.root / '.codex/sessions', sessions):
+            directory.chmod(0o711)
+        (self.root / 't3').chmod(0o700)
         self.root.chmod(0o711)
+        with patch.object(inbox, 'shared_group', return_value=False):
+            with self.assertRaisesRegex(inbox.InboxError, '^t3-data-readable-by-others$'):
+                inbox.login(True, 'http://localhost:9')
+            (self.root / '.codex').chmod(0o700)
+            inbox.require_private()
+        (self.root / 't3').chmod(0o755)
         env = {**self.env, 'T3CODE_HOST': '127.0.0.1', 'T3CODE_PORT': '9'}
         self.assertEqual(self.run_hook(env), '')
         self.assertIn('t3-data-readable-by-others', (inbox.xdg('STATE') / 'hook.log').read_text())

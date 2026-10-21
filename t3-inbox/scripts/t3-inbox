@@ -92,9 +92,10 @@ def shared_group(gid):
 
 
 def exposed(path):
-    """Whether another user could read path: every directory above it searchable
-    and path itself readable, through its 'other' bits or a group with other
-    members. A 711 home still exposes files at known paths, such as T3's database."""
+    """Whether another user could reach path: every directory above it searchable
+    and a file readable, or a directory searchable, through the 'other' bits or a
+    group with other members. Search without read still opens known names, so a
+    711 home exposes T3's database and a 711 transcript directory its files."""
     def allows(st, group_bit, other_bit):
         return bool(st.st_mode & other_bit or (st.st_mode & group_bit and shared_group(st.st_gid)))
     path = Path(path).absolute()
@@ -103,9 +104,10 @@ def exposed(path):
         target = os.stat(path)
     except OSError:
         return False
+    if stat.S_ISDIR(target.st_mode):
+        return all(allows(st, stat.S_IXGRP, stat.S_IXOTH) for st in [*above, target])
     return (all(allows(st, stat.S_IXGRP, stat.S_IXOTH) for st in above)
-            and allows(target, stat.S_IRGRP, stat.S_IROTH)
-            and (not stat.S_ISDIR(target.st_mode) or allows(target, stat.S_IXGRP, stat.S_IXOTH)))
+            and allows(target, stat.S_IRGRP, stat.S_IROTH))
 
 
 def require_private():
