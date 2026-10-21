@@ -7,7 +7,7 @@ matches --repo or --issue, drops what it has already sent, and posts one envelop
 for everything new to the thread's inbox. No LLM runs unless something happened.
 
 The inbox URL is looked up with this skill's `t3-inbox url` at send time and never
-stored or printed; the GitHub token is sent only to --api. Diagnostics name a
+stored or printed; the GitHub token is sent only to --api, redirects included. Diagnostics name a
 reason, never a URL or a token. State advances only after the inbox answers 2xx.
 """
 import argparse
@@ -65,11 +65,24 @@ def token(token_file):
     return value
 
 
+class SameOrigin(urllib.request.HTTPRedirectHandler):
+    """urllib copies Authorization onto redirects: follow them only within the --api origin."""
+
+    def __init__(self, origin):
+        self.origin = origin
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl)[:2] != self.origin:
+            raise WatchError("GitHub redirected outside --api; not followed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class GitHub:
     def __init__(self, api, secret):
         self.api = api.rstrip("/")
         self.origin = urllib.parse.urlsplit(self.api)[:2]
         self.secret = secret
+        self.opener = urllib.request.build_opener(SameOrigin(self.origin))
 
     def get(self, url, what):
         """GET a JSON document; the token goes only to the --api origin. Returns (body, next URL)."""
@@ -81,7 +94,7 @@ class GitHub:
             "Authorization": "Bearer " + self.secret, "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "t3-inbox-gh-watch"})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with self.opener.open(request, timeout=30) as response:
                 body = json.load(response)
                 link = response.headers.get("Link") or ""
         except urllib.error.HTTPError as error:

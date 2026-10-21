@@ -234,6 +234,29 @@ class GhWatch(unittest.TestCase):
         self.assertEqual(foreign.requests, [])
         self.assertFalse(any(r['auth'] for r in self.inbox.requests))
 
+    def test_redirects_stay_on_the_api_origin(self):
+        foreign = Fake()
+        self.addCleanup(foreign.close)
+        foreign.routes['/steal'] = (200, {'user': {'login': 'mallory'}}, {})
+        self.seed()
+        api = self.github.origin
+        self.github.routes['/repos/acme/app/issues/comments/1'] = (302, {}, {'Location': foreign.origin + '/steal'})
+        self.github.routes['/repos/acme/app/issues/comments/2'] = (301, {}, {'Location': api + '/repos/acme/app/issues/comments/9'})
+        self.github.routes['/repos/acme/app/issues/comments/9'] = (200, {'user': {'login': 'alice'}}, {})
+        self.notes.append(notification(1, 'acme/app', 5, '2026-10-21T11:00:00Z', comment=api + '/repos/acme/app/issues/comments/1'))
+        self.notes.append(notification(2, 'acme/app', 6, '2026-10-21T11:01:00Z', comment=api + '/repos/acme/app/issues/comments/2'))
+        code, out = self.run_watch()
+        self.assertEqual(code, 0, out)
+        text = self.inbox.posts()[0]['text']
+        self.assertIn('acme/app#5 [comment] ', text)                          # cross-origin: not followed
+        self.assertIn('acme/app#6 [comment, last comment by alice]', text)    # same origin: followed
+        self.assertEqual(foreign.requests, [])
+        self.github.routes['/notifications'] = (302, {}, {'Location': foreign.origin + '/steal'})
+        code, out = self.run_watch()
+        self.assertEqual(code, 1)
+        self.assertIn('GitHub redirected outside --api; not followed', out)
+        self.assertEqual(foreign.requests, [])
+
     def test_github_error_is_reported(self):
         self.seed()
         self.github.routes['/notifications'] = (401, {'message': 'Bad credentials'}, {})
