@@ -263,6 +263,29 @@ class GhWatch(unittest.TestCase):
         self.assertEqual(self.inbox.posts(), [])
         self.assertEqual(before, {p.name: p.read_text() for p in self.state.iterdir() if p.name != 'lock'})
 
+    def test_token_sources(self):
+        self.seed()
+        self.notes.append(notification(1, 'acme/app', 5, '2026-10-21T11:00:00Z'))
+        del self.env['GH_TOKEN']
+        token_file = self.root / 'token'
+        token_file.write_text(GH_SECRET + '-file\n')
+        code, out = self.run_watch('--token-file', str(token_file))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.github.requests[-1]['auth'], 'Bearer ' + GH_SECRET + '-file')
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        (bin_dir / 'gh').write_text('#!/bin/sh\n[ "$1 $2" = "auth token" ] && echo %s-gh\n' % GH_SECRET)
+        (bin_dir / 'gh').chmod(0o755)
+        self.env['PATH'] = f"{bin_dir}:{self.env.get('PATH', '/usr/bin:/bin')}"
+        self.notes[0]['updated_at'] = '2026-10-21T12:00:00Z'
+        code, out = self.run_watch()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.github.requests[-1]['auth'], 'Bearer ' + GH_SECRET + '-gh')
+        self.env['PATH'] = str(self.root / 'empty')   # no gh anywhere
+        code, out = self.run_watch()
+        self.assertEqual(code, 1)
+        self.assertIn('no GitHub token', out)
+
     def test_needs_something_to_watch(self):
         code, out = self.run_watch(watch=())
         self.assertEqual(code, 1)
