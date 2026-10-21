@@ -8,15 +8,19 @@ import argparse
 import base64
 from contextlib import closing, contextmanager
 import fcntl
+import functools
+import grp
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shlex
 import signal
 import socket
 import sqlite3
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -27,6 +31,9 @@ import uuid
 
 PROMPT = "Inbox message from {{body.from}}: {{body.subject}}\n{{body.text}}\n{{body.url}}\nReply to: {{body.reply_to}}"
 ENVELOPE_FIELDS = ("from", "subject", "text", "url", "reply_to")
+# T3 0.1.1+ answers a filtered delivery 202 and starts no run, so an empty or
+# non-JSON POST no longer becomes a blank turn. notEquals fails on a missing path.
+TEXT_FILTER = {"path": "body.text", "op": "notEquals", "value": ""}
 # Permanent identity contract: never change this namespace after deployment.
 NAMESPACE = uuid.UUID("7b1def85-152e-512f-a5d6-68a161433cd5")
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -70,6 +77,43 @@ def t3_home():
 
 def db_path():
     return t3_home() / "userdata/statev2.sqlite"
+
+
+@functools.cache
+def shared_group(gid):
+    """Whether a user other than this one belongs to group gid."""
+    me = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        members = set(grp.getgrgid(gid).gr_mem)
+    except KeyError:
+        return True
+    members |= {user.pw_name for user in pwd.getpwall() if user.pw_gid == gid}
+    return bool(members - {me})
+
+
+def exposed(path):
+    """Whether another user could read path: every directory above it searchable
+    and path itself readable, through its 'other' bits or a group with other
+    members. A 711 home still exposes files at known paths, such as T3's database."""
+    def allows(st, group_bit, other_bit):
+        return bool(st.st_mode & other_bit or (st.st_mode & group_bit and shared_group(st.st_gid)))
+    path = Path(path).absolute()
+    try:
+        above = [os.stat(parent) for parent in path.parents]
+        target = os.stat(path)
+    except OSError:
+        return False
+    return (all(allows(st, stat.S_IXGRP, stat.S_IXOTH) for st in above)
+            and allows(target, stat.S_IRGRP, stat.S_IROTH)
+            and (not stat.S_ISDIR(target.st_mode) or allows(target, stat.S_IXGRP, stat.S_IXOTH)))
+
+
+def require_private():
+    """Inbox URLs sit in T3's database (mode 644) and in the transcripts, and a
+    URL lets its holder prompt the thread. Refuse unless only this user can read them."""
+    for path in (db_path(), Path.home() / ".claude/projects", Path.home() / ".codex/sessions"):
+        if exposed(path):
+            raise InboxError("t3-data-readable-by-others")
 
 
 def t3_binary():
@@ -341,20 +385,28 @@ def inbox_url(base, task):
 
 
 def open_inbox(thread, base, token):
+    require_private()
     with thread_lock(thread):
         config = thread_config(thread)  # Always refresh, including on cached hook calls.
         current = read_task(task_id(thread))
         if current and not is_inbox(current):
             raise InboxError("task-identity-collision")
+        filters = (current["schedule"].get("filters") or []) if current else []
         if (not current or any(current[k] != v for k, v in config.items())
                 or current["prompt"] != PROMPT or not current["enabled"]
-                or current["creationSource"] != "mcp"):
+                or current["creationSource"] != "mcp" or TEXT_FILTER not in filters):
+            schedule = {"type": "webhook"}
+            if TEXT_FILTER not in filters:
+                # A sent list replaces the stored one, so keep filters added by hand.
+                schedule["filters"] = [*filters, TEXT_FILTER]
             current = rpc(base, token, "scheduledTasks.upsert", {
                 "id": task_id(thread), "title": "Inbox", "prompt": PROMPT,
-                "enabled": True, "schedule": {"type": "webhook"},
+                "enabled": True, "schedule": schedule,
                 # agent/provider would mark deliveries as provider continuations,
                 # which Claude's adapter never sends to the model; MCP uses agent/mcp.
                 "createdBy": "agent", "creationSource": "mcp", **config})["task"]
+            if TEXT_FILTER not in (current["schedule"].get("filters") or []):
+                log_hook("backend-without-filters")  # Before 0.1.1; the inbox still works.
         result = {"threadId": thread, "taskId": task_id(thread),
                   "url": inbox_url(base, current), "envelope": {key: "" for key in ENVELOPE_FIELDS}}
         cache = xdg("CACHE") / (task_id(thread) + ".json")
@@ -414,6 +466,7 @@ def hook(override=None):
 
 
 def login(check, base):
+    require_private()
     if check:
         rpc(base_url(base), bearer(), "scheduledTasks.list", {})
         print("t3-inbox bearer is valid")

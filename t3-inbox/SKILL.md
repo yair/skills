@@ -12,9 +12,10 @@ prompt's context:
 
     Your T3 inbox is live: http://HOST:PORT/api/hooks/<taskId>/<token> — POST JSON {from, subject, text, url, reply_to}; ...
 
-Anyone who can reach the backend over the tailnet can POST to that URL, and
-each POST becomes a turn in the thread. This includes pollers, the engine,
-`curl`, other sessions and other hosts.
+Anyone whose host the tailnet ACL lets reach the backend can POST to that
+URL, and each POST with a `text` becomes a turn in the thread. This includes
+pollers, the engine, `curl`, other sessions and other hosts. The ACL is
+deliberately not symmetric: bakkies, for example, can't reach zhizi's backend.
 
 `t3-inbox` below is the dotfiles shim on `PATH`. It runs this skill's
 `scripts/t3-inbox`, which uses only the Python standard library, through the
@@ -29,12 +30,17 @@ curl -sS -X POST -H 'Content-Type: application/json' "$INBOX_URL" \
   -d '{"from":"zhizi-admin (T3, thread <title>)","subject":"MR 1234 approved","text":"Landing now; nothing needed from you.","url":"https://…","reply_to":"<your inbox URL, if a reply makes sense>"}'
 ```
 
-- **Every field is optional.** Missing ones render empty in this template:
+- **Always send `text`.** Every inbox has a T3 filter that drops a delivery
+  whose `text` is missing or empty, including an empty or non-JSON body. T3
+  still answers 202, but no turn starts and the delivery is logged as
+  filtered. The other fields are optional and render empty when missing:
   `Inbox message from {from}: {subject}` / `{text}` / `{url}` / `Reply to: {reply_to}`.
 - **`from`** says who you are, so the reader can tell where the message came from.
 - **`url`** carries anything third-party, such as a GitHub comment, an issue, or
   a web page. Link it rather than pasting its text into `text`.
-- **`reply_to`** holds your own inbox URL, and only when you want an answer.
+- **`reply_to`** holds your own inbox URL, only when you want an answer, and
+  only if the recipient's host can reach your backend under the ACL.
+  Otherwise the reply can't arrive; ask for an answer through Yair instead.
 - **202 means accepted and logged, nothing more.** The message may wait behind
   a busy turn, and nobody confirms it was read. If you need an acknowledgement,
   ask for one in `text` and include `reply_to`.
@@ -66,6 +72,14 @@ post to the thread. That is the same boundary as the bearer in
 `~/.config/t3-inbox/bearer`: the user account. Don't copy or share transcripts
 of a thread whose inbox should stay private.
 
+T3 leaves its database world-readable (644) under directories others can
+search, so the home directory is what keeps it in. It must be 700: a 711 home still lets other users open a
+file whose path they know, and T3's database always sits at the same path.
+`open`, the hook and `login` refuse with `t3-data-readable-by-others` while
+another user could read the database or the transcripts. Fix the modes; the
+inboxes already in the database were exposed until then, so rotate any that
+matter.
+
 If the URL leaks, rotate it by deleting the task in T3's scheduled-task
 settings (`gc` won't, because the thread is live). The thread's next prompt
 creates the inbox again, under the same task id with a new token.
@@ -78,7 +92,7 @@ creates the inbox again, under the same task id with a new token.
 | `t3-inbox url <taskId\|threadId>` | Prints an existing inbox's URL. Read-only. |
 | `t3-inbox thread-of <session-uuid>` | Maps a Claude or Codex session id to its T3 thread id. |
 | `t3-inbox list` | One JSON line per inbox on this backend: thread, title, task and URL. |
-| `t3-inbox gc [--dry-run]` | Deletes inboxes whose thread is deleted or archived. T3 leaves them behind. |
+| `t3-inbox gc [--dry-run]` | Deletes inboxes whose thread is archived, or was deleted before T3 0.1.1. Since 0.1.1 T3 deletes a thread's inbox along with the thread, but not when the thread is archived. |
 | `t3-inbox login [--check]` | Issues the scoped bearer once per backend user, or checks the existing one. It issues with the backend's own `t3`, `$T3CODE_HOME/runtime/versions/<activeVersion>/t3`, never with `npx`. |
 | `t3-inbox hook` | The `UserPromptSubmit` hook. Not for manual use. |
 
@@ -107,6 +121,9 @@ backend's user.
      To renew it, revoke the old session, delete `bearer`, and log in again.
 3. Codex asks you to trust a new or changed hook once.
 
+The `text` filter needs T3 0.1.1 or later. An older backend accepts the inbox
+without it, and the hook logs `backend-without-filters`.
+
 ## When the "inbox is live" line is missing
 
 The hook never blocks a prompt. On failure it logs one reason code to
@@ -120,6 +137,8 @@ The hook never blocks a prompt. On failure it logs one reason code to
 | `thread-unavailable` | The thread is archived or deleted. |
 | `hook-timeout` | The backend took more than 5 s. |
 | `backend-address-unavailable-use-base` | No `T3CODE_HOST`/`T3CODE_PORT` and no readable `t3code.service`. |
+| `t3-data-readable-by-others` | Another user could read T3's database or the transcripts. Make the home directory 700. |
+| `backend-without-filters` | Logged, but the line still appears: the backend predates 0.1.1, so empty messages still become blank turns. Update T3. |
 
 The hook does nothing when this skill isn't linked into `~/.claude/skills` or
 `~/.codex/skills`.
@@ -184,5 +203,8 @@ would send with `--dry-run` once it has seeded.
   `references/spike-report.md` has the details.
 - **The URL and bearer never appear in diagnostics.** Errors are fixed reason
   codes.
+- **Keep filters added by hand.** T3 replaces the stored filter list when an
+  upsert sends one, so `open` sends the stored list plus `TEXT_FILTER`, and
+  only when that filter is missing.
 - **Tests:** run `python3 -B -m unittest discover -s tests -v` from this
   directory. They cover the helpers too.

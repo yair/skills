@@ -101,7 +101,7 @@ class Fixture(unittest.TestCase):
 
     def add_task(self, **changes):
         task = {'id': inbox.task_id(self.thread), 'title': 'Inbox', 'prompt': inbox.PROMPT,
-                'enabled': True, 'schedule': {'type': 'webhook'},
+                'enabled': True, 'schedule': {'type': 'webhook', 'filters': [inbox.TEXT_FILTER]},
                 **inbox.thread_config(self.thread), 'creationSource': 'mcp',
                 'webhook': {'path': '/api/hooks/test/secret'}}
         task.update(changes)
@@ -215,6 +215,48 @@ class Fixture(unittest.TestCase):
             inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
             payload = rpc.call_args.args[3]
             self.assertEqual((payload['createdBy'], payload['creationSource']), ('agent', 'mcp'))
+
+    def test_open_adds_the_text_filter_and_keeps_others(self):
+        github = {'path': 'headers.x-github-event', 'op': 'exists'}
+        current = self.add_task(schedule={'type': 'webhook', 'filters': [github]})
+        saved = {**current, 'schedule': {'type': 'webhook', 'filters': [github, inbox.TEXT_FILTER]}}
+        with patch.object(inbox, 'rpc', return_value={'task': saved}) as rpc:
+            inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
+            self.assertEqual(rpc.call_args.args[3]['schedule'],
+                             {'type': 'webhook', 'filters': [github, inbox.TEXT_FILTER]})
+        self.assertFalse((inbox.xdg('STATE') / 'hook.log').exists())
+        self.assertEqual(inbox.TEXT_FILTER, {'path': 'body.text', 'op': 'notEquals', 'value': ''})
+
+    def test_open_on_a_backend_without_filters_still_returns_the_url(self):
+        current = self.add_task(schedule={'type': 'webhook'})
+        with patch.object(inbox, 'rpc', return_value={'task': current}) as rpc:
+            result = inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
+            rpc.assert_called_once()
+        self.assertEqual(result['url'], 'http://localhost:9/api/hooks/test/secret')
+        self.assertIn('backend-without-filters', (inbox.xdg('STATE') / 'hook.log').read_text())
+
+    def test_refuses_when_other_users_can_read_t3_data(self):
+        self.add_task()
+        self.with_bearer()
+        for mode, shared, refused in ((0o711, False, True), (0o750, True, True),
+                                      (0o750, False, False), (0o700, True, False)):
+            with self.subTest(mode=oct(mode), shared=shared):
+                self.root.chmod(mode)
+                with patch.object(inbox, 'shared_group', return_value=shared), \
+                        patch.object(inbox, 'rpc') as rpc:
+                    if refused:
+                        with self.assertRaisesRegex(inbox.InboxError, '^t3-data-readable-by-others$'):
+                            inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
+                        with self.assertRaisesRegex(inbox.InboxError, '^t3-data-readable-by-others$'):
+                            inbox.login(True, 'http://localhost:9')
+                    else:
+                        inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
+                    rpc.assert_not_called()
+        self.root.chmod(0o711)
+        env = {**self.env, 'T3CODE_HOST': '127.0.0.1', 'T3CODE_PORT': '9'}
+        self.assertEqual(self.run_hook(env), '')
+        self.assertIn('t3-data-readable-by-others', (inbox.xdg('STATE') / 'hook.log').read_text())
+        self.root.chmod(0o700)
 
     def test_concurrent_open_creates_once(self):
         config = inbox.thread_config(self.thread)
