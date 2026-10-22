@@ -119,6 +119,7 @@ T3's database, as an inbox's do.
 | `backend-without-filters` | T3 predates 0.1.1, so an empty POST would start a blank thread. The launcher is saved disabled and no URL is written. Update T3. |
 | `url-file-unwritable` | OUT's directory is missing or not writable. |
 | `launcher-unavailable` | `rm`: no launcher of that name in that project. |
+| `denied-run-outside-sandbox` | A sandbox refused the backend socket or made `~/.cache` read-only. Codex's does both: from Codex, run the command outside the sandbox. |
 
 ## Handing the URL out
 

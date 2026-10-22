@@ -1,6 +1,7 @@
 """Run from the skill directory: python3 -B -m unittest discover -s tests -v."""
 from concurrent.futures import ThreadPoolExecutor
 import base64
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -512,6 +513,15 @@ class Launchers(Base):
                               '--url-file', str(self.root / 'absent/url'), '--thread', self.thread,
                               '--base', 'http://localhost:9')
         self.assertEqual(result, (1, '', 't3-inbox: url-file-unwritable\n'))
+
+    def test_sandbox_denials_get_a_reason_code(self):
+        argv = ['launcher', 'open', self.NAME, '--prompt-file', str(self.prompt), '--url-file', str(self.out),
+                '--thread', self.thread, '--base', 'http://localhost:9']
+        for error, code in ((PermissionError(errno.EPERM, 'x'), 'denied-run-outside-sandbox'),
+                            (OSError(errno.EROFS, 'x'), 'denied-run-outside-sandbox'),
+                            (ConnectionRefusedError(errno.ECONNREFUSED, 'x'), 'ConnectionRefusedError')):
+            with self.subTest(code=code), patch.object(inbox, 'rpc', side_effect=error):
+                self.assertEqual(self.cli(*argv), (1, '', 't3-inbox: ' + code + '\n'))
 
     def test_list_and_rm(self):
         launcher = self.add_launcher()

@@ -6,6 +6,7 @@ print URLs; diagnostics contain fixed reason codes, never exception contents.
 """
 import argparse
 import base64
+import errno
 from contextlib import closing, contextmanager
 import fcntl
 import functools
@@ -44,6 +45,16 @@ TTL = "365d"  # CLI accepts durations without an explicit upper bound; renew yea
 
 class InboxError(Exception):
     """Arguments must be fixed, credential-free reason codes."""
+
+
+def reason(exc):
+    """The fixed code for exc. A sandbox (Codex's, say) that makes ~/.cache
+    read-only or refuses sockets gets its own code, as Engine shows it."""
+    if isinstance(exc, InboxError):
+        return str(exc)
+    if isinstance(exc, OSError) and exc.errno in (errno.EROFS, errno.EPERM, errno.EACCES):
+        return "denied-run-outside-sandbox"
+    return type(exc).__name__
 
 
 def task_id(thread_id):
@@ -582,7 +593,7 @@ def hook(override=None):
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                                  "additionalContext": context}}))
     except Exception as exc:
-        log_hook(str(exc) if isinstance(exc, InboxError) else type(exc).__name__)
+        log_hook(reason(exc))
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
     return 0
@@ -682,7 +693,7 @@ def main():
             project = args.project or thread_config(session_thread(args.thread))["projectId"]
             print(json.dumps(remove_launcher(args.name, project, base_url(args.base), bearer())))
     except Exception as exc:
-        print("t3-inbox: " + (str(exc) if isinstance(exc, InboxError) else type(exc).__name__), file=sys.stderr)
+        print("t3-inbox: " + reason(exc), file=sys.stderr)
         return 1
     return 0
 
