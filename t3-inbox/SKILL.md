@@ -1,6 +1,6 @@
 ---
 name: t3-inbox
-description: Every T3 Code thread has an inbox, a webhook URL where any sender can POST a JSON message that becomes a turn in that thread. Use when sending a message to another T3 session or to yourself later, handing your inbox URL to Yair, a poller, the engine or another host, opening an inbox for a thread programmatically, finding a thread's inbox, cleaning up inboxes of deleted threads, setting up a cron sender such as `helpers/gh-watch` (wake a thread on GitHub issue, PR or release activity), or when the "Your T3 inbox is live" line is missing. Triggers include "inbox", "notify that session", "send this to the other thread", "webhook URL for this session", "ping me when", "watch this issue", "wake me on GitHub comments", "t3-inbox".
+description: Every T3 Code thread has an inbox, a webhook URL where any sender can POST a JSON message that becomes a turn in that thread. Use when sending a message to another T3 session or to yourself later, handing your inbox URL to Yair, a poller, the engine or another host, opening an inbox for a thread programmatically, finding a thread's inbox, cleaning up inboxes of deleted threads, setting up a cron sender such as `helpers/gh-watch` (wake a thread on GitHub issue, PR or release activity) or `helpers/cmd-watch` (wake a thread when a command's output changes, e.g. a package version in a published image), or when the "Your T3 inbox is live" line is missing. Triggers include "inbox", "notify that session", "send this to the other thread", "webhook URL for this session", "ping me when", "watch this issue", "wake me on GitHub comments", "tell me when this changes", "t3-inbox".
 ---
 
 # t3-inbox — a webhook inbox for every T3 thread
@@ -192,6 +192,35 @@ item: repo, number, reason, the last commenter's login, title and link.
 Every 15 minutes is enough: GitHub asks clients not to poll notifications
 more often than its `X-Poll-Interval`, normally 60 s. Check what a watcher
 would send with `--dry-run` once it has seeded.
+
+### `cmd-watch`: any command's output
+
+Runs a shell command and posts when its output changes. Use it for anything
+without a notification feed: a package version in a published image, a page,
+a file. Write the check so that it prints only what matters. Every change
+starts a turn.
+
+| Option | Meaning |
+|---|---|
+| `--thread ID` | The thread whose inbox gets the messages. Required. |
+| `--name NAME` | A short label (letters, digits, `.`, `_`, `-`). It names the state and the subject, `NAME changed`. Required. |
+| `--check CMD` | Runs under `/bin/sh`, with no stdin. Its stdout, stripped and capped at 4000 characters, is what gets watched. Required. |
+| `--timeout S` | How long the check may run (default 300). |
+| `--from`, `--note` | The envelope's sender, and a line added to every message (say what to do next). |
+| `--base URL` | The T3 backend, for `t3-inbox url`. |
+| `--dry-run` | Print the message. Send and record nothing. |
+
+The first run records the output and sends nothing. A later run that sees
+different output sends one message with the old and new output, and records
+the new output once the inbox answers 2xx. A check that exits non-zero or
+times out sends nothing, keeps the state and exits 1, so a cron `||` can page.
+The log never contains the check's output. State lives in
+`~/.local/state/t3-inbox/cmd-watch/<thread>/<name>/`. Remove the cron line
+once the change you were waiting for has arrived.
+
+```cron
+0 * * * * timeout 900 ~/.claude/skills/t3-inbox/helpers/cmd-watch --thread <threadId> --name <name> --check '<cmd>' --base http://HOST:PORT --note 'Next: <what to do>' >> ~/.local/state/t3-inbox/cmd-watch.log 2>&1
+```
 
 ## Invariants (for whoever edits `scripts/t3-inbox`)
 

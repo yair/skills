@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""cmd-watch: post to a T3 thread's inbox when a check command's output changes. Python stdlib only.
+
+Each run executes --check under /bin/sh and compares its stdout with the output last
+delivered. The first run only records a starting point. A change becomes one envelope
+holding the old and new output; nothing is sent while the output stays the same. A
+check that fails or times out sends nothing and exits 1, so cron's `||` can page.
+
+The inbox URL is looked up with this skill's `t3-inbox url` at send time and never
+stored or printed. Diagnostics name a reason, never a URL or the check's output.
+State advances only after the inbox answers 2xx.
+"""
+import argparse
+from datetime import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+INBOX = Path(__file__).resolve().parents[1] / "scripts/t3-inbox"
+NAME = re.compile(r"^[\w.-]+$")
+MAX_OUTPUT = 4000   # characters of each output kept in the message
+
+
+class WatchError(Exception):
+    """Arguments are fixed reason texts, never URLs or check output."""
+
+
+def log(message):
+    print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}", flush=True)
+
+
+def check(command, timeout):
+    try:
+        result = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True,
+                                timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise WatchError(f"check timed out after {timeout}s")
+    except OSError:
+        raise WatchError("check failed to run")
+    if result.returncode:
+        raise WatchError(f"check exited {result.returncode}")
+    return result.stdout.strip()[:MAX_OUTPUT]
+
+
+def envelope(name, before, after, sender, note):
+    text = f"Was:\n{before or '(empty)'}\n\nNow:\n{after or '(empty)'}" + (f"\n\n{note}" if note else "")
+    return {"from": sender, "subject": f"{name} changed", "text": text}
+
+
+# inbox_url and deliver follow gh-watch's; keep the two in step.
+def inbox_url(command, thread, base):
+    argv = [*command, "url", thread] + (["--base", base] if base else [])
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise WatchError("inbox lookup failed to run")
+    url = result.stdout.strip()
+    if result.returncode or not url.startswith(("http://", "https://")):
+        reason = (result.stderr.strip().splitlines() or ["no output"])[-1][:120]
+        raise WatchError("inbox lookup failed: " + re.sub(r"https?://\S+", "<url>", reason))
+    return url
+
+
+def deliver(url, message):
+    request = urllib.request.Request(url, data=json.dumps(message).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            code = response.status
+    except urllib.error.HTTPError as error:
+        code = error.code
+    except (urllib.error.URLError, OSError):
+        raise WatchError("delivery failed: inbox unreachable")
+    if not 200 <= code < 300:
+        raise WatchError(f"delivery failed: inbox answered HTTP {code}")
+
+
+def run(args):
+    if not NAME.match(args.name):
+        raise WatchError("--name wants letters, digits, '.', '_' or '-'")
+    state = Path(args.state_dir).expanduser() if args.state_dir else (
+        Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+        / "t3-inbox/cmd-watch" / args.thread / args.name)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.chmod(0o700)
+    lock = open(state / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another cmd-watch run holds this state; skipping")
+        return 0
+    last_file = state / "last"
+    output = check(args.check, args.timeout)
+
+    if not last_file.exists():
+        if not args.dry_run:
+            last_file.write_text(output)
+        log(f"seeded {args.name} ({len(output)} chars)" + (" (dry run, nothing written)" if args.dry_run else ""))
+        return 0
+    before = last_file.read_text()
+    if output == before:
+        log(f"{args.name}: no change")
+        return 0
+    message = envelope(args.name, before, output, args.sender, args.note)
+    if args.dry_run:
+        print(json.dumps(message, indent=2, ensure_ascii=False))
+        log(f"dry run: {args.name} changed; would deliver")
+        return 0
+    try:
+        deliver(inbox_url(args.inbox_cmd, args.thread, args.base), message)
+    except WatchError as error:
+        log(f"{error}; the change to {args.name} stays pending")
+        return 1
+    last_file.write_text(output)
+    log(f"delivered: {args.name} changed")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="cmd-watch", description=__doc__.split("\n")[0])
+    parser.add_argument("--thread", required=True, help="T3 thread id whose inbox gets the messages")
+    parser.add_argument("--name", required=True, help="short label for this watch; names its state and subject")
+    parser.add_argument("--check", required=True, help="shell command whose stdout is watched")
+    parser.add_argument("--timeout", type=int, default=300, help="seconds the check may take (default 300)")
+    parser.add_argument("--from", dest="sender",
+                        default=f"cmd-watch ({os.environ.get('USER', '?')}@{socket.gethostname()})")
+    parser.add_argument("--note", help="a line appended to every message, e.g. what to do next")
+    parser.add_argument("--state-dir", help="default $XDG_STATE_HOME/t3-inbox/cmd-watch/<thread>/<name>")
+    parser.add_argument("--base", help="T3 backend origin for `t3-inbox url` (needed under cron)")
+    parser.add_argument("--inbox-cmd", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", action="store_true", help="print the message; send and record nothing")
+    args = parser.parse_args(argv)
+    args.inbox_cmd = args.inbox_cmd.split() if args.inbox_cmd else [sys.executable, str(INBOX)]
+    try:
+        return run(args)
+    except WatchError as error:
+        log(str(error))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
