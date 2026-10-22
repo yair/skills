@@ -303,8 +303,11 @@ once the change you were waiting for has arrived.
   `references/spike-report.md` has the details.
 - **The URL and bearer never appear in diagnostics.** Errors are fixed reason
   codes.
-- **Keep filters added by hand.** T3 replaces the stored filter list when an
+- **Keep what was set by hand when re-saving** (`webhook_schedule`, for
+  inboxes and launchers alike). T3 replaces the stored filter list when an
   upsert sends one, so `open` sends the stored list plus `TEXT_FILTER`, and
-  only when that filter is missing.
+  only when that filter is missing. T3 also drops an omitted signature, with
+  its secret, and an omitted `maxDeliveryAgeMinutes`, so `open` sends both
+  back; a signature sent without a secret keeps the stored secret.
 - **Tests:** run `python3 -B -m unittest discover -s tests -v` from this
   directory. They cover the helpers too.

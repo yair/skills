@@ -230,6 +230,16 @@ class Fixture(Base):
         self.assertFalse((inbox.xdg('STATE') / 'hook.log').exists())
         self.assertEqual(inbox.TEXT_FILTER, {'path': 'body.text', 'op': 'notEquals', 'value': ''})
 
+    def test_open_keeps_a_signature_and_delivery_age_set_by_hand(self):
+        signature = {'header': 'x-hub-signature-256', 'encoding': 'hex', 'prefix': 'sha256='}
+        current = self.add_task(schedule={'type': 'webhook', 'signature': signature,
+                                          'maxDeliveryAgeMinutes': 10})
+        with patch.object(inbox, 'rpc', return_value={'task': current}) as rpc:
+            inbox.open_inbox(self.thread, 'http://localhost:9', 'token')
+        self.assertEqual(rpc.call_args.args[3]['schedule'], {
+            'type': 'webhook', 'signature': signature, 'maxDeliveryAgeMinutes': 10,
+            'filters': [inbox.TEXT_FILTER]})
+
     def test_open_on_a_backend_without_filters_still_returns_the_url(self):
         current = self.add_task(schedule={'type': 'webhook'})
         with patch.object(inbox, 'rpc', return_value={'task': current}) as rpc:
@@ -383,7 +393,10 @@ class Launchers(Base):
         return inbox.read_task(values['task_id'])
 
     def saved(self, base, token, method, payload):
-        return {'task': {**payload, 'webhook': {'path': self.HOOK}}}
+        schedule, stored = dict(payload['schedule']), inbox.read_task(payload['id'])
+        if 'filters' not in schedule and stored:  # T3 0.1.1 keeps omitted filters.
+            schedule['filters'] = stored['schedule'].get('filters') or []
+        return {'task': {**payload, 'schedule': schedule, 'webhook': {'path': self.HOOK}}}
 
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -458,8 +471,27 @@ class Launchers(Base):
             result, _ = inbox.open_launcher(self.NAME, 'new', self.thread, 'http://localhost:9', 'token')
         payload = rpc.call_args.args[3]
         self.assertEqual((payload['id'], result['taskId']), (current['id'], current['id']))
-        self.assertEqual(payload['schedule']['filters'], [github, inbox.TEXT_FILTER])
+        self.assertEqual(payload['schedule'], {'type': 'webhook'})  # T3 keeps omitted filters.
         self.assertEqual((payload['prompt'], payload['enabled']), ('new', True))
+        # Without the text filter, the stored list goes back with it added.
+        self.db.execute('UPDATE scheduled_tasks SET schedule_json=?', (json.dumps(
+            {'type': 'webhook', 'filters': [github]}),))
+        self.db.commit()
+        with patch.object(inbox, 'rpc', side_effect=self.saved) as rpc:
+            inbox.open_launcher(self.NAME, 'new', self.thread, 'http://localhost:9', 'token')
+        self.assertEqual(rpc.call_args.args[3]['schedule']['filters'], [github, inbox.TEXT_FILTER])
+
+    def test_reopen_keeps_a_signature_and_delivery_age_set_by_hand(self):
+        # T3 drops an omitted signature, with its secret; one sent back without
+        # a secret keeps the stored secret.
+        signature = {'header': 'x-hub-signature-256', 'encoding': 'hex', 'prefix': 'sha256='}
+        self.add_launcher(schedule_json=json.dumps({
+            'type': 'webhook', 'signature': signature, 'maxDeliveryAgeMinutes': 10,
+            'filters': [inbox.TEXT_FILTER]}))
+        with patch.object(inbox, 'rpc', side_effect=self.saved) as rpc:
+            inbox.open_launcher(self.NAME, 'new', self.thread, 'http://localhost:9', 'token')
+        self.assertEqual(rpc.call_args.args[3]['schedule'],
+                         {'type': 'webhook', 'signature': signature, 'maxDeliveryAgeMinutes': 10})
 
     def test_open_refuses_a_task_that_is_not_a_launcher(self):
         self.add_launcher(thread_id=self.thread)

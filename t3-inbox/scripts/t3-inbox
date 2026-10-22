@@ -403,6 +403,24 @@ def inbox_url(base, task):
     return base + task["webhook"]["path"]
 
 
+def webhook_schedule(current):
+    """The schedule that re-saves a webhook task without losing what was set on
+    it by hand. T3 resets an omitted signature, with its secret, and an omitted
+    maxDeliveryAgeMinutes; it keeps omitted filters and dedupe. A signature sent
+    back without a secret keeps the stored secret."""
+    stored = current["schedule"] if current else {}
+    schedule = {"type": "webhook"}
+    if stored.get("signature"):
+        schedule["signature"] = {key: stored["signature"][key] for key in ("header", "encoding", "prefix")}
+    if stored.get("maxDeliveryAgeMinutes") is not None:
+        schedule["maxDeliveryAgeMinutes"] = stored["maxDeliveryAgeMinutes"]
+    filters = stored.get("filters") or []
+    if TEXT_FILTER not in filters:
+        # A sent list replaces the stored one, so keep filters added by hand.
+        schedule["filters"] = [*filters, TEXT_FILTER]
+    return schedule
+
+
 def open_inbox(thread, base, token):
     require_private()
     with thread_lock(thread):
@@ -414,13 +432,9 @@ def open_inbox(thread, base, token):
         if (not current or any(current[k] != v for k, v in config.items())
                 or current["prompt"] != PROMPT or not current["enabled"]
                 or current["creationSource"] != "mcp" or TEXT_FILTER not in filters):
-            schedule = {"type": "webhook"}
-            if TEXT_FILTER not in filters:
-                # A sent list replaces the stored one, so keep filters added by hand.
-                schedule["filters"] = [*filters, TEXT_FILTER]
             current = rpc(base, token, "scheduledTasks.upsert", {
                 "id": task_id(thread), "title": "Inbox", "prompt": PROMPT,
-                "enabled": True, "schedule": schedule,
+                "enabled": True, "schedule": webhook_schedule(current),
                 # agent/provider would mark deliveries as provider continuations,
                 # which Claude's adapter never sends to the model; MCP uses agent/mcp.
                 "createdBy": "agent", "creationSource": "mcp", **config})["task"]
@@ -519,11 +533,8 @@ def open_launcher(name, prompt, thread, base, token):
         current = read_task(identifier)
         if current and not is_launcher(current):
             raise InboxError("task-identity-collision")
-        filters = (current["schedule"].get("filters") or []) if current else []
         payload = {"id": identifier, "title": name, "prompt": prompt, "enabled": True,
-                   # A sent list replaces the stored one, so keep filters added by hand.
-                   "schedule": {"type": "webhook", "filters": filters if TEXT_FILTER in filters
-                                else [*filters, TEXT_FILTER]},
+                   "schedule": webhook_schedule(current),
                    "projectId": config["projectId"], "threadId": None,
                    # Never a worktree: not a new one, and not the calling thread's.
                    "workspaceStrategy": dict(ROOT),
