@@ -38,7 +38,7 @@ def server_frame(payload, opcode=1, fin=True):
     return head + b'\x7f' + struct.pack('!Q', size) + payload
 
 
-class Fixture(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -114,6 +114,8 @@ class Fixture(unittest.TestCase):
         self.db.commit()
         return task
 
+
+class Fixture(Base):
     def test_exact_lookup_both_drivers(self):
         self.assertEqual(inbox.thread_of(self.native), self.thread)
         self.mapping('claudeAgent', 'claude-native')
@@ -353,6 +355,195 @@ class Fixture(unittest.TestCase):
         self.runtime(version='1.0.0', state={'activeVersion': '2.0.0'})
         with self.assertRaisesRegex(inbox.InboxError, '^t3-runtime-unavailable$'):
             inbox.login(False, None)
+
+
+class Launchers(Base):
+    NAME = 'Engine launch: zhizi-admin'
+    HOOK = '/api/hooks/launch/launcher-secret'
+
+    def setUp(self):
+        super().setUp()
+        self.with_bearer()
+        self.prompt = self.root / 'prompt'
+        self.prompt.write_text('Launch request:\n{{body.text}}\n')
+        self.out = self.root / 'out' / 'url'
+        self.out.parent.mkdir()
+
+    def add_launcher(self, name=NAME, project='project', **changes):
+        values = {'task_id': inbox.launcher_id(project, name), 'title': name, 'prompt': 'p',
+                  'enabled': 1, 'schedule_json': json.dumps({'type': 'webhook', 'filters': [inbox.TEXT_FILTER]}),
+                  'project_id': project, 'thread_id': None, 'workspace_strategy_json': '{"type": "root"}',
+                  'model_selection_json': json.dumps(self.config['modelSelection']),
+                  'runtime_mode': 'auto', 'interaction_mode': 'default',
+                  'webhook_token': 'launcher-secret', 'creation_source': 'mcp', **changes}
+        self.db.execute('INSERT INTO scheduled_tasks (%s) VALUES (%s)' % (
+            ','.join(values), ','.join('?' * len(values))), list(values.values()))
+        self.db.commit()
+        return inbox.read_task(values['task_id'])
+
+    def saved(self, base, token, method, payload):
+        return {'task': {**payload, 'webhook': {'path': self.HOOK}}}
+
+    def cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(inbox.sys, 'argv', ['t3-inbox', *argv]), \
+                patch.object(inbox.sys, 'stdout', out), patch.object(inbox.sys, 'stderr', err):
+            code = inbox.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_identity_is_per_project_and_name(self):
+        identifier = inbox.launcher_id('project', self.NAME)
+        self.assertEqual(identifier, str(uuid.uuid5(uuid.UUID('7b1def85-152e-512f-a5d6-68a161433cd5'),
+                                                    'launcher:project:' + self.NAME)))
+        self.assertNotEqual(identifier, inbox.launcher_id('other', self.NAME))
+        self.assertNotEqual(identifier, inbox.launcher_id('project', 'Other'))
+        launcher = self.add_launcher()
+        self.assertTrue(inbox.is_launcher(launcher))
+        for bad in ({'threadId': self.thread}, {'title': 'Renamed'}, {'projectId': 'other'},
+                    {'workspaceStrategy': {'type': 'existing_worktree', 'worktreePath': '/w'}},
+                    {'schedule': {'type': 'interval', 'everyMs': 1000}}):
+            with self.subTest(bad=bad):
+                self.assertFalse(inbox.is_launcher({**launcher, **bad}))
+
+    def test_names(self):
+        for name in (self.NAME, 'x', 'n' * 100, 'Ünïcode name'):
+            self.assertEqual(inbox.launcher_name(name), name)
+        for name in ('', ' lead', 'trail ', 'two\nlines', 'tab\there', 'n' * 101):
+            with self.subTest(name=name), self.assertRaisesRegex(inbox.InboxError, '^invalid-launcher-name$'):
+                inbox.launcher_name(name)
+
+    def test_session_thread(self):
+        self.assertEqual(inbox.session_thread('explicit'), 'explicit')
+        with self.assertRaisesRegex(inbox.InboxError, '^no-session-thread-use-thread$'):
+            inbox.session_thread()
+        os.environ['CODEX_THREAD_ID'] = self.native
+        self.assertEqual(inbox.session_thread(), self.thread)
+        # An outer session that isn't a T3 thread doesn't count.
+        os.environ['CLAUDE_CODE_SESSION_ID'] = 'not-a-t3-session'
+        self.assertEqual(inbox.session_thread(), self.thread)
+        self.db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?,?,NULL,NULL)',
+                        ('other-thread', 'project', 'Other', json.dumps(self.config)))
+        self.db.execute('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?)',
+                        ('other-thread', 'claudeAgent', json.dumps(
+                            {'nativeThreadRef': {'driver': 'claudeAgent', 'nativeId': 'claude-native'}})))
+        self.db.commit()
+        os.environ['CLAUDE_CODE_SESSION_ID'] = 'claude-native'
+        with self.assertRaisesRegex(inbox.InboxError, '^ambiguous-session-thread-use-thread$'):
+            inbox.session_thread()
+
+    def test_open_saves_a_root_launcher_from_the_threads_settings(self):
+        with patch.object(inbox, 'rpc', side_effect=self.saved) as rpc:
+            result, url = inbox.open_launcher(self.NAME, 'tmpl {{body.text}}', self.thread,
+                                              'http://localhost:9', 'token')
+        method, payload = rpc.call_args.args[2:]
+        self.assertEqual(method, 'scheduledTasks.upsert')
+        # The thread sits in a worktree on a branch; the launcher ignores both.
+        self.assertEqual(payload, {
+            'id': inbox.launcher_id('project', self.NAME), 'title': self.NAME,
+            'prompt': 'tmpl {{body.text}}', 'enabled': True,
+            'schedule': {'type': 'webhook', 'filters': [inbox.TEXT_FILTER]},
+            'projectId': 'project', 'threadId': None, 'workspaceStrategy': {'type': 'root'},
+            'modelSelection': self.config['modelSelection'], 'runtimeMode': 'auto',
+            'interactionMode': 'default', 'createdBy': 'agent', 'creationSource': 'mcp'})
+        self.assertEqual(result, {'taskId': payload['id'], 'projectId': 'project', 'title': self.NAME,
+                                  'workspace': {'type': 'root'}})
+        self.assertEqual(url, 'http://localhost:9' + self.HOOK)
+
+    def test_reopen_updates_in_place_and_keeps_hand_added_filters(self):
+        github = {'path': 'headers.x-github-event', 'op': 'exists'}
+        current = self.add_launcher(enabled=0, schedule_json=json.dumps(
+            {'type': 'webhook', 'filters': [github, inbox.TEXT_FILTER]}))
+        with patch.object(inbox, 'rpc', side_effect=self.saved) as rpc:
+            result, _ = inbox.open_launcher(self.NAME, 'new', self.thread, 'http://localhost:9', 'token')
+        payload = rpc.call_args.args[3]
+        self.assertEqual((payload['id'], result['taskId']), (current['id'], current['id']))
+        self.assertEqual(payload['schedule']['filters'], [github, inbox.TEXT_FILTER])
+        self.assertEqual((payload['prompt'], payload['enabled']), ('new', True))
+
+    def test_open_refuses_a_task_that_is_not_a_launcher(self):
+        self.add_launcher(thread_id=self.thread)
+        with patch.object(inbox, 'rpc') as rpc, \
+                self.assertRaisesRegex(inbox.InboxError, '^task-identity-collision$'):
+            inbox.open_launcher(self.NAME, 'p', self.thread, 'http://localhost:9', 'token')
+        rpc.assert_not_called()
+
+    def test_open_parks_the_launcher_on_a_backend_without_filters(self):
+        def old_backend(base, token, method, payload):
+            return {'task': {**payload, 'schedule': {'type': 'webhook'}, 'webhook': {'path': self.HOOK}}}
+        with patch.object(inbox, 'rpc', side_effect=old_backend) as rpc, \
+                self.assertRaisesRegex(inbox.InboxError, '^backend-without-filters$'):
+            inbox.open_launcher(self.NAME, 'p', self.thread, 'http://localhost:9', 'token')
+        self.assertEqual(rpc.call_count, 2)
+        self.assertFalse(rpc.call_args.args[3]['enabled'])
+
+    def test_cli_open_writes_the_url_only_to_the_file(self):
+        self.out.parent.chmod(0o755)
+        os.environ['CLAUDE_CODE_SESSION_ID'] = self.native
+        with patch.object(inbox, 'rpc', side_effect=self.saved) as rpc:
+            code, out, err = self.cli('launcher', 'open', self.NAME, '--prompt-file', str(self.prompt),
+                                      '--url-file', str(self.out), '--base', 'http://localhost:9')
+        self.assertEqual((code, err), (0, ''))
+        self.assertEqual(rpc.call_args.args[3]['prompt'], self.prompt.read_text())
+        self.assertEqual(json.loads(out), {'taskId': inbox.launcher_id('project', self.NAME),
+                                           'projectId': 'project', 'title': self.NAME,
+                                           'workspace': {'type': 'root'}})
+        self.assertNotIn('launcher-secret', out)
+        self.assertEqual(self.out.read_text(), 'http://localhost:9' + self.HOOK + '\n')
+        self.assertEqual(self.out.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.out.parent.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(os.listdir(self.out.parent), ['url'])
+        self.assertFalse((inbox.xdg('STATE') / 'hook.log').exists())
+
+    def test_cli_open_failures_are_reason_codes(self):
+        bad = self.root / 'bad'
+        cases = [(['--prompt-file', str(self.root / 'missing')], 'invalid-prompt-file'),
+                 (['--prompt-file', str(self.prompt), '--thread', 'missing'], 'thread-unavailable'),
+                 (['--prompt-file', str(self.prompt)], 'no-session-thread-use-thread'),
+                 (['--prompt-file', str(bad), '--thread', self.thread], 'invalid-prompt-file')]
+        bad.write_bytes(b'\xff\xfe')
+        for extra, code in cases:
+            with self.subTest(code=code), patch.object(inbox, 'rpc', side_effect=self.saved):
+                result = self.cli('launcher', 'open', self.NAME, '--url-file', str(self.out),
+                                  '--base', 'http://localhost:9', *extra)
+                self.assertEqual(result, (1, '', 't3-inbox: ' + code + '\n'))
+                self.assertFalse(self.out.exists())
+        with patch.object(inbox, 'rpc', side_effect=self.saved):
+            result = self.cli('launcher', 'open', self.NAME, '--prompt-file', str(self.prompt),
+                              '--url-file', str(self.root / 'absent/url'), '--thread', self.thread,
+                              '--base', 'http://localhost:9')
+        self.assertEqual(result, (1, '', 't3-inbox: url-file-unwritable\n'))
+
+    def test_list_and_rm(self):
+        launcher = self.add_launcher()
+        self.add_launcher(name='Other', project='elsewhere')
+        self.add_task()
+        code, out, err = self.cli('launcher', 'list')
+        self.assertEqual((code, err), (0, ''))
+        lines = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual(sorted(line['title'] for line in lines), [self.NAME, 'Other'])
+        self.assertEqual(set(lines[0]), {'taskId', 'projectId', 'title', 'enabled'})
+        self.assertNotIn('secret', out)
+        with patch.object(inbox, 'rpc') as rpc:
+            self.assertEqual(self.cli('launcher', 'rm', 'Missing', '--project', 'project', '--base', 'http://x')[2],
+                             't3-inbox: launcher-unavailable\n')
+            rpc.assert_not_called()
+            code, out, _ = self.cli('launcher', 'rm', self.NAME, '--thread', self.thread, '--base', 'http://x')
+            self.assertEqual(code, 0)
+            self.assertEqual(rpc.call_args.args[2:], ('scheduledTasks.delete', {'id': launcher['id']}))
+            self.assertEqual(json.loads(out)['taskId'], launcher['id'])
+
+    def test_gc_and_url_leave_launchers_alone(self):
+        # Even one titled like an inbox: is_inbox needs a thread, which a launcher lacks.
+        for name in (self.NAME, 'Inbox'):
+            launcher = self.add_launcher(name=name)
+            self.assertFalse(inbox.is_inbox(launcher))
+            self.assertEqual(self.cli('url', launcher['id'], '--base', 'http://x'),
+                             (1, '', 't3-inbox: inbox-unavailable\n'))
+        self.assertEqual(inbox.inboxes(), [])
+        with patch.object(inbox, 'rpc') as rpc:
+            self.assertEqual(self.cli('gc', '--base', 'http://x'), (0, '', ''))
+            rpc.assert_not_called()
+        self.assertEqual(len(inbox.launchers()), 2)
 
 
 class Protocol(unittest.TestCase):

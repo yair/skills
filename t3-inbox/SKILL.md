@@ -1,6 +1,6 @@
 ---
 name: t3-inbox
-description: Every T3 Code thread has an inbox, a webhook URL where any sender can POST a JSON message that becomes a turn in that thread. Use when sending a message to another T3 session or to yourself later, handing your inbox URL to Yair, a poller, the engine or another host, opening an inbox for a thread programmatically, finding a thread's inbox, cleaning up inboxes of deleted threads, setting up a cron sender such as `helpers/gh-watch` (wake a thread on GitHub issue, PR or release activity) or `helpers/cmd-watch` (wake a thread when a command's output changes, e.g. a package version in a published image), or when the "Your T3 inbox is live" line is missing. Triggers include "inbox", "notify that session", "send this to the other thread", "webhook URL for this session", "ping me when", "watch this issue", "wake me on GitHub comments", "tell me when this changes", "t3-inbox".
+description: Every T3 Code thread has an inbox, a webhook URL where any sender can POST a JSON message that becomes a turn in that thread. Use when sending a message to another T3 session or to yourself later, handing your inbox URL to Yair, a poller, the engine or another host, opening an inbox for a thread programmatically, setting up a launcher (a webhook that starts a fresh thread per POST, as `engine genius launcher open` does), finding a thread's inbox, cleaning up inboxes of deleted threads, setting up a cron sender such as `helpers/gh-watch` (wake a thread on GitHub issue, PR or release activity) or `helpers/cmd-watch` (wake a thread when a command's output changes, e.g. a package version in a published image), or when the "Your T3 inbox is live" line is missing. Triggers include "inbox", "notify that session", "send this to the other thread", "webhook URL for this session", "ping me when", "watch this issue", "wake me on GitHub comments", "tell me when this changes", "launcher", "start a thread on webhook", "t3-inbox".
 ---
 
 # t3-inbox — a webhook inbox for every T3 thread
@@ -55,6 +55,71 @@ curl -sS -X POST -H 'Content-Type: application/json' "$INBOX_URL" \
   information. Thank-you replies loop between agents.
 - **An inbox turn interrupts nothing.** It queues behind the current turn.
 
+## Launchers: a fresh thread per POST
+
+An inbox wakes a thread that already exists. A launcher starts a new thread
+for every POST. It is a T3 webhook task bound to no thread. Each delivery
+fills in the launcher's prompt template, and the result becomes the first
+message of a new thread in the project root. Engine's
+`engine genius launcher open` makes one launcher per genius this way.
+
+    t3-inbox launcher open NAME --prompt-file FILE --url-file OUT [--thread THREAD]
+
+- **The new threads' settings come from THREAD:** its project, model,
+  runtime mode and interaction mode. THREAD defaults to the session the
+  command runs in (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`). The
+  workspace is always the project root, never a new worktree and never
+  THREAD's own worktree.
+- **NAME** is the task's title, and so the title of every thread it starts
+  until the thread renames itself. It is free text, up to 100 characters,
+  on one line.
+- **Running `open` again updates the launcher in place.** The task id is
+  `uuid5(namespace, "launcher:" + projectId + ":" + NAME)`, and T3 keeps the
+  token when a task is re-saved, so the URL stays the same. The same NAME
+  in another project is a different launcher.
+- **The prompt is FILE, verbatim.** It may use `{{body.*}}` placeholders,
+  as an inbox's does. A POST without a non-empty `text` starts nothing, as
+  for inboxes.
+- **The URL goes only into OUT**, written with mode 0600. stdout is a JSON
+  object with `taskId`, `projectId`, `title` and `workspace`, and errors
+  are reason codes. `url`, `list` and `gc` are for inboxes and ignore
+  launchers.
+
+**The template is the trusted part. The body is not.** T3 frames every
+body value as untrusted webhook data, and anyone with the URL chooses it.
+So the template should tell the new session what to do and where to get
+the details: point it at a trusted source, and let the body carry only a
+reference into that source. Engine's template, for example, takes a request
+id from `text` and has the session read the request from Engine with
+`engine genius take-launch <id>`. A template that just says "do what the
+body says" hands the project to whoever holds the URL.
+
+**A launcher URL is a stronger credential than an inbox URL.** Every POST
+starts a thread and a model run. Hand it out on the rules below. To rotate
+it, delete the launcher (`launcher rm`, or in T3's scheduled-task settings)
+and run `open` again; the URL changes.
+
+T3 logs each delivery with its filled-in prompt, so body values end up in
+T3's database, as an inbox's do.
+
+| Command | What it does |
+|---|---|
+| `t3-inbox launcher open NAME --prompt-file F --url-file OUT [--thread T]` | Creates or updates a launcher, as above. |
+| `t3-inbox launcher list` | One JSON line per launcher on this backend: task, project, title, enabled. No URLs. |
+| `t3-inbox launcher rm NAME [--thread T \| --project P]` | Deletes the launcher NAME in that project. The project defaults to this session's thread's. |
+
+| Code | Meaning |
+|---|---|
+| `no-session-thread-use-thread` | Not run from a T3 session; pass `--thread`. |
+| `ambiguous-session-thread-use-thread` | The Claude and Codex session ids map to two different T3 threads; pass `--thread`. |
+| `thread-unavailable` | THREAD is archived, deleted or unknown. |
+| `invalid-launcher-name` | Empty, over 100 characters, padded with spaces, or with a control character. |
+| `invalid-prompt-file` | Unreadable, empty, over 64 KiB, or not UTF-8. |
+| `task-identity-collision` | The launcher's task id belongs to a task that isn't a launcher. |
+| `backend-without-filters` | T3 predates 0.1.1, so an empty POST would start a blank thread. The launcher is saved disabled and no URL is written. Update T3. |
+| `url-file-unwritable` | OUT's directory is missing or not writable. |
+| `launcher-unavailable` | `rm`: no launcher of that name in that project. |
+
 ## Handing the URL out
 
 The URL contains the token, so it is a credential.
@@ -92,7 +157,8 @@ creates the inbox again, under the same task id with a new token.
 | `t3-inbox url <taskId\|threadId>` | Prints an existing inbox's URL. Read-only. |
 | `t3-inbox thread-of <session-uuid>` | Maps a Claude or Codex session id to its T3 thread id. |
 | `t3-inbox list` | One JSON line per inbox on this backend: thread, title, task and URL. |
-| `t3-inbox gc [--dry-run]` | Deletes inboxes whose thread is archived, or was deleted before T3 0.1.1. Since 0.1.1 T3 deletes a thread's inbox along with the thread, but not when the thread is archived. |
+| `t3-inbox gc [--dry-run]` | Deletes inboxes whose thread is archived, or was deleted before T3 0.1.1. Since 0.1.1 T3 deletes a thread's inbox along with the thread, but not when the thread is archived. It never touches launchers. |
+| `t3-inbox launcher open\|list\|rm` | Launchers; see above. |
 | `t3-inbox login [--check]` | Issues the scoped bearer once per backend user, or checks the existing one. It issues with the backend's own `t3`, `$T3CODE_HOME/runtime/versions/<activeVersion>/t3`, never with `npx`. |
 | `t3-inbox hook` | The `UserPromptSubmit` hook. Not for manual use. |
 
@@ -226,7 +292,11 @@ once the change you were waiting for has arrived.
 
 - **`statev2.sqlite` is read-only, always.** Every write goes through the
   backend's client RPC (`scheduledTasks.upsert` / `.delete`).
-- **The uuid5 namespace never changes.** Changing it orphans every inbox.
+- **The uuid5 namespace never changes.** Changing it orphans every inbox
+  and launcher. Launcher names are prefixed `launcher:` so they never meet
+  an inbox's thread id.
+- **`gc` and `url` stay inbox-only.** `is_inbox` requires a `threadId`,
+  which a launcher never has; the tests pin this.
 - **Create tasks as `createdBy: agent`, `creationSource: mcp`.** The
   `agent`/`provider` pair makes Claude's adapter drop every delivery silently;
   `references/spike-report.md` has the details.
