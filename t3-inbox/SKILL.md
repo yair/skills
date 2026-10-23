@@ -168,6 +168,22 @@ from `T3CODE_HOST`/`T3CODE_PORT` or the `t3code.service` unit's environment.
 Commands talk to the backend as the user they run as, so run them as the
 backend's user.
 
+## Thread and session ids are written whole
+
+A T3 thread id is the whole string, prefix and all: `mcp:<uuid>`,
+`thread:project:<project uuid>:<uuid>` for threads that launchers and
+project tools create, `import:codex:<uuid>`, or a bare UUID for a thread
+started in the UI. Pass it whole to `t3-inbox open`, every `--thread`,
+`t3_thread_read`, `t3_thread_configuration` and the other T3 tools. The
+trailing UUID alone names no thread: T3 answers `thread_not_found`, `open`
+fails with `thread-unavailable` and `url` with `inbox-unavailable`.
+
+Never shorten a thread id or a Claude or Codex session id (what `thread-of`
+takes), in commands or in prose. `claude --resume`, `codex resume`,
+transcript search and T3 all need the full id. Only Engine ids (tasks,
+changes, launch requests) may be cut to 8 characters, because Engine
+resolves prefixes.
+
 ## Setup, once per backend user
 
 1. Pull dotfiles, which provide the `t3-inbox` shim and the two hook entries,
