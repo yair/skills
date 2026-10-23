@@ -894,6 +894,20 @@ def descendants(root):
     return out
 
 
+# T3 starts a Claude agent through `sh -c`, which forks this watchdog and then
+# execs the agent, so the watchdog is the harness's own child in every T3
+# Claude session (CLAUDE_GROUP_WATCH_SCRIPT in T3 0.1.2). It ends with the
+# session and is nothing the session started.
+T3_GROUP_WATCH = "{ trap '' TERM; read -r _ <&3; kill -TERM 0;"
+
+
+def t3_group_watch(pid, argv, harness_pid):
+    if argv[1:2] != ["-c"] or not argv[2:3] or not argv[2].startswith(T3_GROUP_WATCH):
+        return False
+    chain = ancestors(pid)
+    return len(chain) > 1 and chain[1][0] == harness_pid
+
+
 def check_processes(sess, rep, harness_pid):
     bg = [c for c in sess.commands if c.background]
     if not harness_pid:
@@ -911,7 +925,8 @@ def check_processes(sess, rep, harness_pid):
                 argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
         except OSError:
             continue
-        if argv and os.path.basename(argv[0]) in ("bash", "sh", "zsh") and "-c" in argv[:3]:
+        if argv and os.path.basename(argv[0]) in ("bash", "sh", "zsh") and "-c" in argv[:3] \
+                and not t3_group_watch(pid, argv, harness_pid):
             running.append((pid, " ".join(argv)))
     for pid, cmdline in running:
         body = cmdline.split("eval", 1)[-1][:120]
