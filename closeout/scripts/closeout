@@ -908,6 +908,20 @@ def t3_group_watch(pid, argv, harness_pid):
     return len(chain) > 1 and chain[1][0] == harness_pid
 
 
+def current_command(harness_pid):
+    """The command running this check: the harness's child above closeout
+    (the tool call's shell) and everything below it. Its other pipeline stages
+    run in forked copies of that shell when they are functions, groups or
+    loops, and look like jobs. A job it puts in the background leaves the
+    harness's tree once the command ends, so no later check could see it
+    either. Background tool calls are other children of the harness."""
+    chain = ancestors()
+    for (pid, _), (ppid, _) in zip(chain, chain[1:]):
+        if ppid == harness_pid:
+            return {pid, *descendants(pid)}
+    return set()
+
+
 def check_processes(sess, rep, harness_pid):
     bg = [c for c in sess.commands if c.background]
     if not harness_pid:
@@ -915,7 +929,7 @@ def check_processes(sess, rep, harness_pid):
             rep.add("INFO", "procs", "bg:" + c.cmd[:40], f"background job started: {c.cmd[:100]}",
                     "confirm it finished or was stopped")
         return
-    mine = {p for p, _ in ancestors()}
+    mine = {p for p, _ in ancestors()} | current_command(harness_pid)
     running = []
     for pid in descendants(harness_pid):
         if pid in mine:
